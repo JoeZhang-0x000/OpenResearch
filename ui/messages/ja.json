@@ -116,6 +116,7 @@
   "chat_panel_selected_text": "選択したテキスト:",
   "chat_panel_run": "実行",
   "chat_panel_send": "送信",
+  "chat_panel_sent_a_follow_up_to_an_agent": "エージェントにフォローアップを送信しました",
   "chat_panel_session_options": "セッションのオプション",
   "chat_panel_session_title": "セッションのタイトル",
   "chat_panel_show_sidebar": "サイドバーを表示",

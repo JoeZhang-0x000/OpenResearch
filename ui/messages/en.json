@@ -116,6 +116,7 @@
   "chat_panel_selected_text": "Selected text:",
   "chat_panel_run": "Run",
   "chat_panel_send": "Send",
+  "chat_panel_sent_a_follow_up_to_an_agent": "Sent a follow-up to an agent",
   "chat_panel_session_options": "Session options",
   "chat_panel_session_title": "Session title",
   "chat_panel_show_sidebar": "Show sidebar",

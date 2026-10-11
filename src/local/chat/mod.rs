@@ -5057,10 +5057,11 @@ impl ChatHost {
         .await
     }
 
-    /// Deliver a spawned helper's brief as the opening message of its session.
-    /// Visible, unlike a wake-up: the brief *is* that transcript's starting
-    /// point, and hiding it would leave the helper apparently working unbidden.
-    /// `record_brief` is false on a retry, where it is already in the
+    /// Deliver a spawn row's prompt as the session's next user message: the
+    /// opening brief on a fresh spawn, or the follow-up an `orx agent send`
+    /// queued. Visible, unlike a wake-up: the prompt *is* that transcript's
+    /// context, and hiding it would leave the helper apparently working
+    /// unbidden. `record_brief` is false on a retry, where it is already in the
     /// transcript — this persists the bubble before it can report a failure.
     async fn send_spawn_task(
         self: &Arc<Self>,
@@ -8357,6 +8358,33 @@ fn spawn_outcome(store: &Store, session: &StoredChatSession) -> Result<SpawnOutc
     })
 }
 
+/// Whether the spawn row's prompt is already the transcript's tip: a retry
+/// whose earlier attempt persisted the user bubble but never started the turn
+/// must not record it twice. Anything else — an empty transcript on a fresh
+/// spawn, or an earlier exchange tipping a follow-up's session — means the
+/// prompt has not been recorded and the bubble belongs in the transcript.
+fn spawn_prompt_recorded(store: &Store, spawn: &crate::store::ChatSpawn) -> Result<bool> {
+    let messages = store.list_chat_messages(&spawn.session_id)?;
+    let session = store
+        .get_chat_session(&spawn.session_id)?
+        .ok_or_else(|| anyhow!("spawned session disappeared"))?;
+    let path = active_path(&messages, session.active_leaf_id.as_deref());
+    let Some(latest) = path.last() else {
+        return Ok(false);
+    };
+    if latest.role != "user" {
+        return Ok(false);
+    }
+    let parts: Vec<WirePart> = serde_json::from_str(&latest.parts_json)?;
+    let shown = parts
+        .iter()
+        .filter(|part| part.kind == "text")
+        .filter_map(|part| part.text.as_deref())
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(shown.trim() == spawn.prompt.trim())
+}
+
 /// Where the helper's work is. Deliberately claims no branch: session worktrees
 /// start detached, so a helper only has one if it ran `orx create-experiment`.
 fn spawn_workspace(store: &Store, session: &StoredChatSession) -> String {
@@ -8388,18 +8416,33 @@ fn spawn_report_text(
         .map(|title| format!(" (\"{title}\")"))
         .unwrap_or_default();
     let brief = truncated(spawn.prompt.trim(), SPAWN_BRIEF_LIMIT);
-    let stopped = "Its session holds however far it got. Re-delegate it if you still need the \
-                   task done.";
+    let is_send = spawn.kind == crate::store::ChatSpawnKind::Send;
+    let stopped = if is_send {
+        "Its session holds however far it got. Send it again if you still need the answer."
+    } else {
+        "Its session holds however far it got. Re-delegate it if you still need the task done."
+    };
     let (headline, closing) = if interrupted {
         ("was interrupted before it finished", stopped.to_string())
     } else {
         match spawn_outcome(store, &child)? {
-            SpawnOutcome::Reply(reply) => {
-                ("has finished", format!("Its closing reply:\n\n{reply}"))
-            }
+            SpawnOutcome::Reply(reply) => (
+                if is_send { "replied" } else { "has finished" },
+                format!(
+                    "{}:\n\n{reply}",
+                    if is_send {
+                        "Its reply"
+                    } else {
+                        "Its closing reply"
+                    }
+                ),
+            ),
             SpawnOutcome::Failed(error) => (
                 "failed",
-                format!("It ended on an error and did NOT do the task:\n\n{error}"),
+                format!(
+                    "It ended on an error and did NOT {}:\n\n{error}",
+                    if is_send { "answer" } else { "do the task" }
+                ),
             ),
             SpawnOutcome::Interrupted => ("was stopped before it finished", stopped.to_string()),
             SpawnOutcome::Silent => (
@@ -8409,20 +8452,38 @@ fn spawn_report_text(
             ),
         }
     };
+    let intro = if is_send {
+        format!(
+            "The agent you sent a follow-up, `{}`{named}",
+            spawn.session_id
+        )
+    } else {
+        format!("The agent you spawned for `{}`{named}", spawn.session_id)
+    };
+    let brief_label = if is_send {
+        "You sent it"
+    } else {
+        "It was asked to"
+    };
     Ok(format!(
-        "[orx] The agent you spawned for `{}`{named} {headline}.\n\nIt was asked to: {brief}\n\n\
-         {closing}{}",
-        spawn.session_id,
+        "[orx] {intro} {headline}.\n\n{brief_label}: {brief}\n\n{closing}{}",
         spawn_workspace(store, &child),
     ))
 }
 
 fn spawn_start_failure_text(spawn: &crate::store::ChatSpawn) -> String {
+    let brief = truncated(spawn.prompt.trim(), SPAWN_BRIEF_LIMIT);
+    if spawn.kind == crate::store::ChatSpawnKind::Send {
+        return format!(
+            "[orx] The agent you sent a follow-up, `{}`, could NOT run it, so your message went \
+             unanswered. You sent it: {brief}\n\nSend it again, or do the task here.",
+            spawn.session_id,
+        );
+    }
     format!(
         "[orx] The agent you spawned for `{}` could NOT be started, so the task was not done. \
-         It was asked to: {}\n\nDo the task here, or delegate it again.",
+         It was asked to: {brief}\n\nDo the task here, or delegate it again.",
         spawn.session_id,
-        truncated(spawn.prompt.trim(), SPAWN_BRIEF_LIMIT),
     )
 }
 
@@ -8490,11 +8551,16 @@ async fn process_chat_spawns(
         // dashboard's Recents as it starts working, not after its first flush.
         chat.emit_session(store.get_chat_session(&spawn.session_id)?)
             .await;
-        // A retry must not re-record the brief: `send_message_showing` persists
+        // A retry must not re-record the prompt: `send_message_showing` persists
         // the user message before it can report the turn didn't start.
-        let record_brief = store.list_chat_messages(&spawn.session_id)?.is_empty();
+        let record_prompt = !spawn_prompt_recorded(&store, &spawn)?;
         let started = chat
-            .send_spawn_task(&spawn.session_id, spawn.prompt.clone(), record_brief, guard)
+            .send_spawn_task(
+                &spawn.session_id,
+                spawn.prompt.clone(),
+                record_prompt,
+                guard,
+            )
             .await;
         // Running even for a fire-and-forget spawn: the second loop retires it
         // once the helper is actually idle, so `--no-wake` cannot slip past the
@@ -10460,6 +10526,7 @@ with other project runs using `orx runs p1` and inspect the file located by `orx
                 wake_parent: true,
                 attempts: 0,
                 finished_at: None,
+                kind: crate::store::ChatSpawnKind::Spawn,
             })
             .unwrap();
         if matches!(state, ChatSpawnState::Running) {
@@ -10484,6 +10551,7 @@ with other project runs using `orx runs p1` and inspect the file located by `orx
             wake_parent: true,
             attempts: 0,
             finished_at: Some(1),
+            kind: crate::store::ChatSpawnKind::Spawn,
         }
     }
 
@@ -10599,6 +10667,7 @@ with other project runs using `orx runs p1` and inspect the file located by `orx
             wake_parent: true,
             attempts: 0,
             finished_at: None,
+            kind: crate::store::ChatSpawnKind::Spawn,
         };
 
         let text = spawn_report_text(&store, &spawn, true).unwrap();
@@ -10726,6 +10795,7 @@ with other project runs using `orx runs p1` and inspect the file located by `orx
             wake_parent: true,
             attempts: 0,
             finished_at: Some(1),
+            kind: crate::store::ChatSpawnKind::Spawn,
         };
 
         let text = spawn_report_text(&store, &spawn, false).unwrap();

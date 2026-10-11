@@ -1,6 +1,7 @@
 //! The `agent` command group: delegate work to a second agent session.
 //!
-//!   orx agent spawn "<task>"   start a helper agent on its own top-level session
+//!   orx agent spawn "<task>"          start a helper agent on its own top-level session
+//!   orx agent send <id> "<message>"   send a follow-up to a helper this chat spawned
 //!
 //! Only meaningful inside a local `orx up` agent session. `ORX_LOCAL_SESSION`
 //! marks the process as one; `ORX_CHAT_SESSION_ID` names the session doing the
@@ -9,10 +10,11 @@
 //!
 //! This command only writes the child's session row and a `chat_spawns` record;
 //! it never runs the child itself. The resident `orx up` picks the record up,
-//! starts the helper's first turn, and (unless `--no-wake`) wakes the parent
-//! when the helper is done. Same store-and-watcher split as `orx exp wake`, and for
-//! the same reason: the CLI is a short-lived subprocess with no harness of its
-//! own to run a turn on.
+//! starts the helper's next turn, and wakes the parent when the helper is done
+//! (unless the spawn passed `--no-wake`; a send always wakes it — the caller is
+//! waiting on an answer). Same store-and-watcher split as `orx exp wake`, and
+//! for the same reason: the CLI is a short-lived subprocess with no harness of
+//! its own to run a turn on.
 
 use std::io::Read;
 
@@ -36,33 +38,37 @@ pub async fn run(args: crate::AgentArgs) -> Result<()> {
             model,
             no_wake,
         } => spawn(&store, task, stdin, title, harness, model, !no_wake).await,
+        AgentCommand::Send {
+            session,
+            message,
+            stdin,
+        } => send(&store, &session, message, stdin).await,
     }
 }
 
-/// Read the task from the positional argument or, with `--stdin`, from the
-/// whole of stdin (agents write multi-paragraph briefs as heredocs).
-fn task_text(task: Option<String>, stdin: bool) -> Result<String> {
+/// Read the prompt from the positional argument or, with `--stdin`, from the
+/// whole of stdin (agents write multi-paragraph briefs as heredocs). `usage`
+/// names the calling subcommand in the empty-prompt error.
+fn task_text(task: Option<String>, stdin: bool, usage: &str) -> Result<String> {
     if stdin {
         if task.is_some() {
             return Err(anyhow!(
-                "Pass the task as an argument or --stdin, not both."
+                "Pass the text as an argument or --stdin, not both."
             ));
         }
         let mut buf = String::new();
         std::io::stdin()
             .read_to_string(&mut buf)
-            .map_err(|e| anyhow!("Could not read the task from stdin: {e}"))?;
-        return non_empty(buf);
+            .map_err(|e| anyhow!("Could not read the text from stdin: {e}"))?;
+        return non_empty(buf, usage);
     }
-    non_empty(task.unwrap_or_default())
+    non_empty(task.unwrap_or_default(), usage)
 }
 
-fn non_empty(text: String) -> Result<String> {
+fn non_empty(text: String, usage: &str) -> Result<String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        return Err(anyhow!(
-            "Describe the task for the spawned agent: `orx agent spawn \"<task>\"`."
-        ));
+        return Err(anyhow!(usage.to_string()));
     }
     Ok(trimmed.to_string())
 }
@@ -133,7 +139,11 @@ async fn spawn(
     let parent = store
         .get_chat_session(&parent_id)?
         .ok_or_else(|| anyhow!("The current chat session no longer exists."))?;
-    let prompt = task_text(task, stdin)?;
+    let prompt = task_text(
+        task,
+        stdin,
+        "Describe the task for the spawned agent: `orx agent spawn \"<task>\"`.",
+    )?;
     if let Some(refusal) = spawn_refusal(&parent, store.count_live_chat_spawns(&parent_id)?) {
         return Err(anyhow!(refusal));
     }
@@ -201,6 +211,7 @@ async fn spawn(
         wake_parent,
         attempts: 0,
         finished_at: None,
+        kind: crate::store::ChatSpawnKind::Spawn,
     })?;
     tx.commit()?;
     println!("Spawned agent session {}.", session.id);
@@ -210,6 +221,50 @@ async fn spawn(
     } else {
         println!("You will NOT be told when it finishes; check its session yourself.");
     }
+    Ok(())
+}
+
+/// Queue a follow-up for a helper this chat spawned. Only the spawn row is
+/// touched: the message goes back through the resident `orx up` watcher, which
+/// appends it to the helper's transcript, runs the turn on the helper's own
+/// harness/model/worktree, and wakes this chat with the reply — the identical
+/// cycle the spawn used, so the same guardrails apply.
+async fn send(store: &Store, session_id: &str, message: Option<String>, stdin: bool) -> Result<()> {
+    if !crate::local::chat::in_local_session() {
+        return Err(anyhow!(
+            "`orx agent send` is only available inside a local `orx up` agent session."
+        ));
+    }
+    let parent_id = crate::local::chat::launching_chat_session()
+        .ok_or_else(|| anyhow!("This agent session has no chat id to send from."))?;
+    let spawn = store.get_chat_spawn(session_id)?.ok_or_else(|| {
+        anyhow!(
+            "`{session_id}` is not a helper this chat can message. Only sessions started by \
+             `orx agent spawn` take follow-ups; spawn prints their session id."
+        )
+    })?;
+    if spawn.parent_session_id != parent_id {
+        return Err(anyhow!(
+            "Helper session {session_id} was spawned by a different chat; only the session that \
+             spawned it can send it follow-ups."
+        ));
+    }
+    if store.get_chat_session(&spawn.session_id)?.is_none() {
+        return Err(anyhow!("Helper session {session_id} no longer exists."));
+    }
+    let message = task_text(
+        message,
+        stdin,
+        "Write the follow-up for the helper: `orx agent send <session> \"<message>\"`.",
+    )?;
+    if !store.rearm_chat_spawn(&spawn.session_id, &message)? {
+        return Err(anyhow!(
+            "Helper session {session_id} is still working — wait for its reply before sending \
+             another follow-up."
+        ));
+    }
+    println!("Sent your follow-up to agent session {}.", spawn.session_id);
+    println!("This chat will be resumed with its reply when it finishes.");
     Ok(())
 }
 
@@ -265,14 +320,22 @@ mod tests {
 
     #[test]
     fn a_task_is_required_and_comes_from_one_place() {
+        let usage = "Describe the task for the spawned agent: `orx agent spawn \"<task>\"`.";
         assert_eq!(
-            task_text(Some("  Sweep the literature  ".into()), false).unwrap(),
+            task_text(Some("  Sweep the literature  ".into()), false, usage).unwrap(),
             "Sweep the literature"
         );
-        assert!(task_text(None, false).is_err());
-        assert!(task_text(Some("   ".into()), false).is_err());
+        assert!(task_text(None, false, usage).is_err());
+        assert!(task_text(Some("   ".into()), false, usage).is_err());
         // --stdin and a positional together are ambiguous, so neither is used.
-        assert!(task_text(Some("from the args".into()), true).is_err());
+        assert!(task_text(Some("from the args".into()), true, usage).is_err());
+        // The empty-prompt error names the calling subcommand.
+        let send_usage =
+            "Write the follow-up for the helper: `orx agent send <session> \"<message>\"`.";
+        assert_eq!(
+            task_text(None, false, send_usage).unwrap_err().to_string(),
+            send_usage
+        );
     }
 
     #[test]

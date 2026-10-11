@@ -354,9 +354,11 @@ pub enum RunWakeupRegistration {
     AlreadyDelivered,
 }
 
-/// A helper session an agent created with `orx agent spawn`, and the task it
-/// was spawned to do. The CLI only writes the row; the resident `orx up`
-/// watcher is what starts the child's first turn and reports back.
+/// A helper session an agent created with `orx agent spawn`, and the prompt
+/// it currently owes the child: the spawn brief on a fresh row, or the
+/// follow-up a later `orx agent send` re-armed it with. The CLI only writes
+/// the row; the resident `orx up` watcher is what runs the turn and reports
+/// back.
 #[derive(Debug, Clone)]
 pub struct ChatSpawn {
     pub session_id: String,
@@ -364,12 +366,41 @@ pub struct ChatSpawn {
     pub prompt: String,
     /// Whether the parent gets a wake-up once the helper finishes.
     pub wake_parent: bool,
-    /// Failed attempts to start the helper's first turn.
+    /// Failed attempts to start the helper's next turn.
     pub attempts: i64,
     /// Set by `finish_turn` when the helper's turn ends. Absent on a row whose
     /// turn is still running — or whose `orx up` died mid-turn, which is how a
     /// crash is told from a completion.
     pub finished_at: Option<i64>,
+    /// What `prompt` holds: the opening brief or a follow-up message.
+    pub kind: ChatSpawnKind,
+}
+
+/// Whether a [`ChatSpawn`] row is delivering the session's first task or a
+/// later follow-up from `orx agent send`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatSpawnKind {
+    /// `orx agent spawn`: the row was written with the session it starts.
+    Spawn,
+    /// `orx agent send`: a finished row was re-armed with a follow-up, which
+    /// the same deliver-turn-report cycle then runs.
+    Send,
+}
+
+impl ChatSpawnKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Spawn => "spawn",
+            Self::Send => "send",
+        }
+    }
+
+    fn from_str(raw: &str) -> Self {
+        match raw {
+            "send" => Self::Send,
+            _ => Self::Spawn,
+        }
+    }
 }
 
 /// Lifecycle of a [`ChatSpawn`]: `Pending → Starting → Running → Waking →
@@ -622,7 +653,8 @@ impl Store {
                 claim_token       TEXT,
                 claimed_at        INTEGER,
                 attempts          INTEGER NOT NULL DEFAULT 0,
-                finished_at       INTEGER
+                finished_at       INTEGER,
+                kind              TEXT NOT NULL DEFAULT 'spawn'
             );
             CREATE INDEX IF NOT EXISTS idx_chat_spawns_state
                 ON chat_spawns(state, requested_at);
@@ -711,6 +743,7 @@ impl Store {
             "ALTER TABLE chat_spawns ADD COLUMN wake_parent INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE chat_spawns ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE chat_spawns ADD COLUMN finished_at INTEGER",
+            "ALTER TABLE chat_spawns ADD COLUMN kind TEXT NOT NULL DEFAULT 'spawn'",
             "ALTER TABLE chat_messages ADD COLUMN completed_at INTEGER",
             "ALTER TABLE runs ADD COLUMN cancel_reason TEXT",
         ] {
@@ -1382,17 +1415,36 @@ impl Store {
     pub fn create_chat_spawn(&self, spawn: &ChatSpawn) -> Result<()> {
         self.conn.execute(
             "INSERT INTO chat_spawns
-                 (session_id, parent_session_id, prompt, wake_parent, state, requested_at)
-             VALUES (?1, ?2, ?3, ?4, 'pending', ?5)",
+                 (session_id, parent_session_id, prompt, wake_parent, state, requested_at, kind)
+             VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6)",
             params![
                 spawn.session_id,
                 spawn.parent_session_id,
                 spawn.prompt,
                 spawn.wake_parent,
                 now_ms(),
+                spawn.kind.as_str(),
             ],
         )?;
         Ok(())
+    }
+
+    /// Re-queue a finished helper for an `orx agent send` follow-up: the
+    /// retired row goes back to `pending` holding the new message, so the
+    /// watcher runs the same deliver-turn-report cycle as the spawn did — the
+    /// reply still wakes the parent even when the spawn was `--no-wake`.
+    /// `false` means the helper is still mid-task; the `state = 'done'` guard
+    /// keeps a send from clobbering a turn already in flight.
+    pub fn rearm_chat_spawn(&self, session_id: &str, prompt: &str) -> Result<bool> {
+        let rearmed = self.conn.execute(
+            "UPDATE chat_spawns
+             SET state = 'pending', prompt = ?2, kind = 'send', wake_parent = 1,
+                 attempts = 0, finished_at = NULL, requested_at = ?3,
+                 claim_token = NULL, claimed_at = NULL
+             WHERE session_id = ?1 AND state = 'done'",
+            params![session_id, prompt, now_ms()],
+        )?;
+        Ok(rearmed == 1)
     }
 
     /// Return abandoned claims to their prior state and drop rows whose child
@@ -1424,7 +1476,7 @@ impl Store {
     /// Spawns sitting in one state, oldest request first.
     pub fn list_chat_spawns(&self, state: ChatSpawnState) -> Result<Vec<ChatSpawn>> {
         let mut stmt = self.conn.prepare(
-            "SELECT session_id, parent_session_id, prompt, wake_parent, attempts, finished_at
+            "SELECT session_id, parent_session_id, prompt, wake_parent, attempts, finished_at, kind
              FROM chat_spawns WHERE state = ?1 ORDER BY requested_at, session_id",
         )?;
         let rows = stmt.query_map(params![state.as_str()], row_to_chat_spawn)?;
@@ -1433,7 +1485,7 @@ impl Store {
 
     pub fn get_chat_spawn(&self, session_id: &str) -> Result<Option<ChatSpawn>> {
         let mut stmt = self.conn.prepare(
-            "SELECT session_id, parent_session_id, prompt, wake_parent, attempts, finished_at
+            "SELECT session_id, parent_session_id, prompt, wake_parent, attempts, finished_at, kind
              FROM chat_spawns WHERE session_id = ?1",
         )?;
         let mut rows = stmt.query_map(params![session_id], row_to_chat_spawn)?;
@@ -3376,6 +3428,7 @@ fn row_to_chat_spawn(row: &rusqlite::Row<'_>) -> std::result::Result<ChatSpawn, 
         wake_parent: row.get(3)?,
         attempts: row.get(4)?,
         finished_at: row.get(5)?,
+        kind: ChatSpawnKind::from_str(&row.get::<_, String>(6)?),
     })
 }
 
@@ -4509,6 +4562,7 @@ mod tests {
             wake_parent: true,
             attempts: 0,
             finished_at: None,
+            kind: crate::store::ChatSpawnKind::Spawn,
         }
     }
 
@@ -4751,6 +4805,71 @@ mod tests {
         let pending = store.list_chat_spawns(ChatSpawnState::Pending).unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].session_id, "chat_stuck");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_finished_spawn_rearms_once_for_a_follow_up() {
+        let dir =
+            std::env::temp_dir().join(format!("orx-store-spawnrearm-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        store
+            .create_chat_session(&chat_session_fixture("chat_child"))
+            .unwrap();
+        store
+            .create_chat_spawn(&chat_spawn_fixture("chat_child", "chat_parent"))
+            .unwrap();
+
+        // Drive the row to `done` the way the watcher does, with a settled
+        // claim left behind and a stale attempt count.
+        let token = store
+            .claim_chat_spawn(
+                "chat_child",
+                ChatSpawnState::Pending,
+                ChatSpawnState::Starting,
+            )
+            .unwrap()
+            .unwrap();
+        store
+            .settle_chat_spawn("chat_child", &token, ChatSpawnState::Running)
+            .unwrap();
+        store.record_chat_spawn_attempt("chat_child").unwrap();
+        let token = store
+            .claim_chat_spawn(
+                "chat_child",
+                ChatSpawnState::Running,
+                ChatSpawnState::Waking,
+            )
+            .unwrap()
+            .unwrap();
+        store
+            .settle_chat_spawn("chat_child", &token, ChatSpawnState::Done)
+            .unwrap();
+        store.mark_chat_spawn_finished("chat_child").unwrap();
+
+        assert!(store
+            .rearm_chat_spawn("chat_child", "Also check the GPT-Neo baseline")
+            .unwrap());
+        let rearmed = store.get_chat_spawn("chat_child").unwrap().unwrap();
+        assert_eq!(rearmed.prompt, "Also check the GPT-Neo baseline");
+        assert_eq!(rearmed.kind, crate::store::ChatSpawnKind::Send);
+        assert!(rearmed.wake_parent);
+        assert_eq!(rearmed.attempts, 0);
+        assert_eq!(rearmed.finished_at, None);
+        assert_eq!(
+            store
+                .list_chat_spawns(ChatSpawnState::Pending)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(store.count_live_chat_spawns("chat_parent").unwrap(), 1);
+
+        // A row already back in flight must not be re-armed mid-turn.
+        assert!(!store
+            .rearm_chat_spawn("chat_child", "And the GPT-2 one too")
+            .unwrap());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

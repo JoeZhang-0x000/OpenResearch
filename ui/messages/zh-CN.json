@@ -116,6 +116,7 @@
   "chat_panel_selected_text": "已选文本：",
   "chat_panel_run": "运行",
   "chat_panel_send": "发送",
+  "chat_panel_sent_a_follow_up_to_an_agent": "已向智能体发送后续消息",
   "chat_panel_session_options": "会话选项",
   "chat_panel_session_title": "会话标题",
   "chat_panel_show_sidebar": "显示侧边栏",

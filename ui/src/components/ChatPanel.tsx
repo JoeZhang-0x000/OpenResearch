@@ -1555,6 +1555,14 @@ function computeToolActivity(part: ChatPart): ToolActivity {
           litCall: litCall ?? undefined,
         };
       }
+      if (commandInvokesOrx(command, "agent\\s+send")) {
+        return {
+          kind: "agent",
+          label: m.chat_panel_sent_a_follow_up_to_an_agent(),
+          spawnedSessionIds: spawnedSessionIds(toolOutput),
+          litCall: litCall ?? undefined,
+        };
+      }
       const shellInvocations = shellSegments.map((segment) => shellInvocation(segment.raw));
       const readsExperimentStatus = commandInvokesOrx(command, "exp\\s+status");
       const readsExperimentNotes = commandInvokesOrx(command, "exp\\s+desc");

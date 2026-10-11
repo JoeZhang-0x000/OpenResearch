@@ -395,6 +395,18 @@ pub enum AgentCommand {
         #[arg(long)]
         no_wake: bool,
     },
+    /// Send a follow-up message to a helper this chat spawned. The message
+    /// lands in the helper's own transcript and runs as its next turn; this
+    /// chat resumes with the helper's reply, like the closing report.
+    Send {
+        /// The helper's session id, as `orx agent spawn` printed it.
+        session: String,
+        /// The message to send. Read from stdin instead with --stdin.
+        message: Option<String>,
+        /// Read the message from stdin instead, for long multi-paragraph notes.
+        #[arg(long)]
+        stdin: bool,
+    },
 }
 
 #[derive(Args, Debug)]
