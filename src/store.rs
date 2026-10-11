@@ -403,6 +403,17 @@ impl ChatSpawnKind {
     }
 }
 
+/// Outcome of [`Store::rearm_chat_spawn`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatSpawnRearm {
+    /// The row is back to `pending` holding the follow-up.
+    Rearmed,
+    /// The helper is still mid-turn (or no such row exists).
+    Busy,
+    /// The parent already has `max_live` helpers in flight.
+    AtCap,
+}
+
 /// Lifecycle of a [`ChatSpawn`]: `Pending → Starting → Running → Waking →
 /// Done`. The two `-ing` states are claims — one watcher owns the transition
 /// and holds a token, so a crash mid-step is reclaimable rather than lost.
@@ -1433,18 +1444,42 @@ impl Store {
     /// retired row goes back to `pending` holding the new message, so the
     /// watcher runs the same deliver-turn-report cycle as the spawn did — the
     /// reply still wakes the parent even when the spawn was `--no-wake`.
-    /// `false` means the helper is still mid-task; the `state = 'done'` guard
-    /// keeps a send from clobbering a turn already in flight.
-    pub fn rearm_chat_spawn(&self, session_id: &str, prompt: &str) -> Result<bool> {
+    /// The `state = 'done'` guard keeps a send from clobbering a turn already
+    /// in flight, and the cap subquery keeps check-and-rearm atomic: a send
+    /// racing another send or a spawn cannot push the parent over `max_live`.
+    pub fn rearm_chat_spawn(
+        &self,
+        session_id: &str,
+        prompt: &str,
+        max_live: i64,
+    ) -> Result<ChatSpawnRearm> {
         let rearmed = self.conn.execute(
             "UPDATE chat_spawns
              SET state = 'pending', prompt = ?2, kind = 'send', wake_parent = 1,
                  attempts = 0, finished_at = NULL, requested_at = ?3,
                  claim_token = NULL, claimed_at = NULL
-             WHERE session_id = ?1 AND state = 'done'",
-            params![session_id, prompt, now_ms()],
+             WHERE session_id = ?1 AND state = 'done'
+               AND (SELECT count(*) FROM chat_spawns others
+                    WHERE others.parent_session_id = chat_spawns.parent_session_id
+                      AND others.state != 'done') < ?4",
+            params![session_id, prompt, now_ms(), max_live],
         )?;
-        Ok(rearmed == 1)
+        if rearmed == 1 {
+            return Ok(ChatSpawnRearm::Rearmed);
+        }
+        let state = self
+            .conn
+            .query_row(
+                "SELECT state FROM chat_spawns WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(match state.as_deref() {
+            // Still retired, so the cap — not the turn guard — refused it.
+            Some("done") => ChatSpawnRearm::AtCap,
+            _ => ChatSpawnRearm::Busy,
+        })
     }
 
     /// Return abandoned claims to their prior state and drop rows whose child
@@ -4848,9 +4883,12 @@ mod tests {
             .unwrap();
         store.mark_chat_spawn_finished("chat_child").unwrap();
 
-        assert!(store
-            .rearm_chat_spawn("chat_child", "Also check the GPT-Neo baseline")
-            .unwrap());
+        assert_eq!(
+            store
+                .rearm_chat_spawn("chat_child", "Also check the GPT-Neo baseline", 5)
+                .unwrap(),
+            crate::store::ChatSpawnRearm::Rearmed
+        );
         let rearmed = store.get_chat_spawn("chat_child").unwrap().unwrap();
         assert_eq!(rearmed.prompt, "Also check the GPT-Neo baseline");
         assert_eq!(rearmed.kind, crate::store::ChatSpawnKind::Send);
@@ -4867,9 +4905,75 @@ mod tests {
         assert_eq!(store.count_live_chat_spawns("chat_parent").unwrap(), 1);
 
         // A row already back in flight must not be re-armed mid-turn.
-        assert!(!store
-            .rearm_chat_spawn("chat_child", "And the GPT-2 one too")
-            .unwrap());
+        assert_eq!(
+            store
+                .rearm_chat_spawn("chat_child", "And the GPT-2 one too", 5)
+                .unwrap(),
+            crate::store::ChatSpawnRearm::Busy
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_send_is_refused_once_the_parent_is_at_the_live_cap() {
+        let dir =
+            std::env::temp_dir().join(format!("orx-store-spawnrearmcap-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        store
+            .create_chat_session(&chat_session_fixture("chat_child"))
+            .unwrap();
+        store
+            .create_chat_spawn(&chat_spawn_fixture("chat_child", "chat_parent"))
+            .unwrap();
+        // The done helper does not count itself, so five *other* live helpers
+        // is exactly at the cap.
+        for n in 0..5 {
+            let id = format!("chat_live_{n}");
+            store
+                .create_chat_session(&chat_session_fixture(&id))
+                .unwrap();
+            store
+                .create_chat_spawn(&chat_spawn_fixture(&id, "chat_parent"))
+                .unwrap();
+        }
+        store
+            .conn
+            .execute(
+                "UPDATE chat_spawns SET state = 'done' WHERE session_id = 'chat_child'",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(
+            store
+                .rearm_chat_spawn("chat_child", "One more thing", 5)
+                .unwrap(),
+            crate::store::ChatSpawnRearm::AtCap
+        );
+        let row = store.get_chat_spawn("chat_child").unwrap().unwrap();
+        assert_eq!(row.prompt, "Sweep the literature for LoRA rank ablations");
+        assert_eq!(row.kind, crate::store::ChatSpawnKind::Spawn);
+        assert!(store
+            .list_chat_spawns(ChatSpawnState::Pending)
+            .unwrap()
+            .iter()
+            .all(|spawn| spawn.session_id != "chat_child"));
+
+        // Once one helper reports back, the same send goes through.
+        store
+            .conn
+            .execute(
+                "UPDATE chat_spawns SET state = 'done' WHERE session_id = 'chat_live_0'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .rearm_chat_spawn("chat_child", "One more thing", 5)
+                .unwrap(),
+            crate::store::ChatSpawnRearm::Rearmed
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

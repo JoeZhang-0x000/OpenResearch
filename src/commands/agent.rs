@@ -257,11 +257,20 @@ async fn send(store: &Store, session_id: &str, message: Option<String>, stdin: b
         stdin,
         "Write the follow-up for the helper: `orx agent send <session> \"<message>\"`.",
     )?;
-    if !store.rearm_chat_spawn(&spawn.session_id, &message)? {
-        return Err(anyhow!(
-            "Helper session {session_id} is still working — wait for its reply before sending \
-             another follow-up."
-        ));
+    match store.rearm_chat_spawn(&spawn.session_id, &message, MAX_LIVE_SPAWNS)? {
+        crate::store::ChatSpawnRearm::Rearmed => {}
+        crate::store::ChatSpawnRearm::Busy => {
+            return Err(anyhow!(
+                "Helper session {session_id} is still working — wait for its reply before sending \
+                 another follow-up."
+            ));
+        }
+        crate::store::ChatSpawnRearm::AtCap => {
+            return Err(anyhow!(
+                "You already have {MAX_LIVE_SPAWNS} agents in flight, the most one session may run \
+                 at once. Wait for one to report back before sending {session_id} another message."
+            ));
+        }
     }
     println!("Sent your follow-up to agent session {}.", spawn.session_id);
     println!("This chat will be resumed with its reply when it finishes.");

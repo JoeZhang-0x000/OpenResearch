@@ -10653,6 +10653,74 @@ with other project runs using `orx runs p1` and inspect the file located by `orx
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    fn user_message(
+        session: &str,
+        id: &str,
+        parent: Option<&str>,
+        text: &str,
+    ) -> StoredChatMessage {
+        StoredChatMessage {
+            id: id.into(),
+            session_id: session.into(),
+            role: "user".into(),
+            parts_json: serde_json::to_string(&[WirePart::text(format!("{id}-part"), text)])
+                .unwrap(),
+            created_at: 1,
+            completed_at: None,
+            parent_id: parent.map(str::to_string),
+            base_native_session_id: None,
+            result_native_session_id: None,
+        }
+    }
+
+    #[test]
+    fn the_prompt_is_recorded_unless_it_already_tips_the_transcript() {
+        let (store, dir) = temp_store("spawn-prompt-tip");
+        let spawn_at = |child: &str| {
+            session(&store, child);
+            spawn_row(&store, child, "parent", ChatSpawnState::Pending);
+            store.get_chat_spawn(child).unwrap().unwrap()
+        };
+
+        // Nothing recorded yet — a fresh spawn's brief must be persisted.
+        assert!(!spawn_prompt_recorded(&store, &spawn_at("child_a")).unwrap());
+
+        // The prompt as the unanswered tip is the retried-send shape: skip it.
+        let tipped = spawn_at("child_b");
+        store
+            .upsert_chat_message(&user_message("child_b", "u1", None, "Sweep the literature"))
+            .unwrap();
+        assert!(spawn_prompt_recorded(&store, &tipped).unwrap());
+
+        // A different tip text means the prompt was never persisted.
+        let other = spawn_at("child_c");
+        store
+            .upsert_chat_message(&user_message(
+                "child_c",
+                "u2",
+                None,
+                "Something else entirely",
+            ))
+            .unwrap();
+        assert!(!spawn_prompt_recorded(&store, &other).unwrap());
+
+        // An identical earlier prompt that the helper already answered does
+        // not tip the transcript: a fresh send of the same text still records.
+        let answered = spawn_at("child_d");
+        store
+            .upsert_chat_message(&user_message("child_d", "u3", None, "Sweep the literature"))
+            .unwrap();
+        store
+            .upsert_chat_message(&StoredChatMessage {
+                session_id: "child_d".into(),
+                ..assistant_message("a1", Some("u3"), "done sweeping")
+            })
+            .unwrap();
+        assert!(!spawn_prompt_recorded(&store, &answered).unwrap());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn an_interrupted_helper_is_not_reported_as_finished() {
         let (store, dir) = temp_store("spawn-interrupted");
