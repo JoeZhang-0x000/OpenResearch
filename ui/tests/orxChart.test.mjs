@@ -119,6 +119,13 @@ test("y-only zoom retains confidence bands crossing the selected range", () => {
   assert.ok(crossing.layout.xmin<4.6 && crossing.layout.xmax>6.4);
 });
 
+test("a wrapped legend grows the chart so the plot keeps its minimum height", () => {
+  const {layout, svg} = render({type:"line"}, [run], "document.querySelector('#legend').offsetHeight=180;draw()");
+  assert.equal(layout.top, 244);
+  assert.equal(layout.height, 440);
+  assert.equal(svg.style.height, "440px");
+});
+
 test("arrow inspection skips fitted-only slices without creating invalid cursors", () => {
   const {svg}=render({type:"scaling"},[{name:"Fit",points:[{step:1,loss:2},{step:10,loss:2}],fit:[{step:1,loss:1},{step:10,loss:1}]}],"domain={x:[4,6]};draw();chart.onkeydown({key:'ArrowRight',preventDefault(){}})");
   assert.ok(!svg.children.some(node=>node.attributes.id==='cursor'));
