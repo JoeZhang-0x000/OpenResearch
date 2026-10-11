@@ -2705,6 +2705,8 @@ mod tests {
         let trusted_dir = base.join("trusted");
         let refused_dir = base.join("refused");
         std::fs::create_dir_all(&trusted_dir).unwrap();
+        // A permissive umask must not turn the trusted fixture group-writable.
+        std::fs::set_permissions(&trusted_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::create_dir_all(&refused_dir).unwrap();
         // World-writable install directory: the scenario the probe must refuse.
         std::fs::set_permissions(&refused_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
@@ -2714,7 +2716,10 @@ mod tests {
             let binary = dir.join("orx");
             std::fs::write(
                 &binary,
-                format!("#!/bin/sh\ntouch {}\necho 'orx 9.9.9'\n", flag.display()),
+                format!(
+                    "#!/bin/sh\ntouch {}\necho 'orx 9.9.9'\n",
+                    crate::jobs::ssh::sh_quote(flag.to_str().unwrap())
+                ),
             )
             .unwrap();
             std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
