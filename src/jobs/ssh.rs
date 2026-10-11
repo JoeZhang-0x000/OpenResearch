@@ -621,6 +621,7 @@ async fn ssh_run_file(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
         .map_err(|e| anyhow!("Could not run ssh: {e}"))?;
     let mut file = tokio::fs::File::open(source).await?;
@@ -642,6 +643,13 @@ async fn ssh_run_file(
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Source uploads are restarted a few times on failure: a dropped SSH
+/// connection mid-stream surfaces as a client-side write error (on Windows,
+/// broken pipe os error 232 writing to ssh's stdin) and the remote script's
+/// byte-length check makes any partial upload safe to re-run.
+const SOURCE_UPLOAD_ATTEMPTS: usize = 3;
+const SOURCE_UPLOAD_RETRY_DELAY: Duration = Duration::from_secs(2);
+
 /// Upload a content-addressed tar once, then materialize it into this run's
 /// private `repo/` directory. Both the cache write and extraction are safe to
 /// repeat after a client or supervisor restart.
@@ -657,7 +665,25 @@ pub async fn stage_source(
     let size = tokio::fs::metadata(archive).await?.len();
     let (check, upload) = source_cache_commands(&cache, size);
     if ssh_run(target, &check, None).await?.trim() != "present" {
-        ssh_run_file(target, &upload, archive).await?;
+        let mut last_err = None;
+        for attempt in 1..=SOURCE_UPLOAD_ATTEMPTS {
+            match ssh_run_file(target, &upload, archive).await {
+                Ok(_) => {
+                    last_err = None;
+                    break;
+                }
+                Err(e) => last_err = Some(e),
+            }
+            if attempt < SOURCE_UPLOAD_ATTEMPTS {
+                tokio::time::sleep(SOURCE_UPLOAD_RETRY_DELAY).await;
+            }
+        }
+        if let Some(err) = last_err {
+            return Err(anyhow!(
+                "uploading source archive to {} failed after {SOURCE_UPLOAD_ATTEMPTS} attempts: {err:#}",
+                target.dest
+            ));
+        }
     }
     if let Some(container) = container {
         container.require_running(target).await?;
