@@ -1423,11 +1423,17 @@ impl Store {
         Ok(delivered == 1)
     }
 
-    pub fn create_chat_spawn(&self, spawn: &ChatSpawn) -> Result<()> {
-        self.conn.execute(
+    /// Insert the row as `pending`, unless the parent already has `max_live`
+    /// helpers in flight: the cap check is folded into the same statement, so
+    /// a spawn racing another spawn or an `orx agent send` rearm cannot push
+    /// the parent over it. `false` means the cap refused the insert.
+    pub fn create_chat_spawn(&self, spawn: &ChatSpawn, max_live: i64) -> Result<bool> {
+        let inserted = self.conn.execute(
             "INSERT INTO chat_spawns
                  (session_id, parent_session_id, prompt, wake_parent, state, requested_at, kind)
-             VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6)",
+             SELECT ?1, ?2, ?3, ?4, 'pending', ?5, ?6
+             WHERE (SELECT count(*) FROM chat_spawns
+                    WHERE parent_session_id = ?2 AND state != 'done') < ?7",
             params![
                 spawn.session_id,
                 spawn.parent_session_id,
@@ -1435,9 +1441,10 @@ impl Store {
                 spawn.wake_parent,
                 now_ms(),
                 spawn.kind.as_str(),
+                max_live,
             ],
         )?;
-        Ok(())
+        Ok(inserted == 1)
     }
 
     /// Re-queue a finished helper for an `orx agent send` follow-up: the
@@ -4757,7 +4764,7 @@ mod tests {
             .create_chat_session(&chat_session_fixture("chat_child"))
             .unwrap();
         store
-            .create_chat_spawn(&chat_spawn_fixture("chat_child", "chat_parent"))
+            .create_chat_spawn(&chat_spawn_fixture("chat_child", "chat_parent"), i64::MAX)
             .unwrap();
 
         let pending = store.list_chat_spawns(ChatSpawnState::Pending).unwrap();
@@ -4809,7 +4816,7 @@ mod tests {
                 .create_chat_session(&chat_session_fixture(id))
                 .unwrap();
             store
-                .create_chat_spawn(&chat_spawn_fixture(id, "chat_parent"))
+                .create_chat_spawn(&chat_spawn_fixture(id, "chat_parent"), i64::MAX)
                 .unwrap();
         }
 
@@ -4853,7 +4860,7 @@ mod tests {
             .create_chat_session(&chat_session_fixture("chat_child"))
             .unwrap();
         store
-            .create_chat_spawn(&chat_spawn_fixture("chat_child", "chat_parent"))
+            .create_chat_spawn(&chat_spawn_fixture("chat_child", "chat_parent"), i64::MAX)
             .unwrap();
 
         // Drive the row to `done` the way the watcher does, with a settled
@@ -4924,7 +4931,7 @@ mod tests {
             .create_chat_session(&chat_session_fixture("chat_child"))
             .unwrap();
         store
-            .create_chat_spawn(&chat_spawn_fixture("chat_child", "chat_parent"))
+            .create_chat_spawn(&chat_spawn_fixture("chat_child", "chat_parent"), i64::MAX)
             .unwrap();
         // The done helper does not count itself, so five *other* live helpers
         // is exactly at the cap.
@@ -4934,7 +4941,7 @@ mod tests {
                 .create_chat_session(&chat_session_fixture(&id))
                 .unwrap();
             store
-                .create_chat_spawn(&chat_spawn_fixture(&id, "chat_parent"))
+                .create_chat_spawn(&chat_spawn_fixture(&id, "chat_parent"), i64::MAX)
                 .unwrap();
         }
         store

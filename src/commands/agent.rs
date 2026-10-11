@@ -201,18 +201,27 @@ async fn spawn(
         updated_at: now_ms(),
     };
     // One transaction: a session row without its spawn row is an empty session
-    // in the user's sidebar that nothing will ever start.
+    // in the user's sidebar that nothing will ever start. The write lock it
+    // holds from `create_chat_session` makes the spawn row's cap check atomic
+    // against a racing spawn or send — the refusal covers a racer that took
+    // the last slot since `spawn_refusal` ran.
     let tx = store.begin()?;
     store.create_chat_session(&session)?;
-    store.create_chat_spawn(&ChatSpawn {
-        session_id: session.id.clone(),
-        parent_session_id: parent_id,
-        prompt,
-        wake_parent,
-        attempts: 0,
-        finished_at: None,
-        kind: crate::store::ChatSpawnKind::Spawn,
-    })?;
+    let created = store.create_chat_spawn(
+        &ChatSpawn {
+            session_id: session.id.clone(),
+            parent_session_id: parent_id,
+            prompt,
+            wake_parent,
+            attempts: 0,
+            finished_at: None,
+            kind: crate::store::ChatSpawnKind::Spawn,
+        },
+        MAX_LIVE_SPAWNS,
+    )?;
+    if !created {
+        return Err(anyhow!(spawn_refusal(&parent, MAX_LIVE_SPAWNS).unwrap()));
+    }
     tx.commit()?;
     println!("Spawned agent session {}.", session.id);
     println!("It starts within a few seconds and works in its own git worktree.");

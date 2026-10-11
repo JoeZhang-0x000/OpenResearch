@@ -10519,15 +10519,18 @@ with other project runs using `orx runs p1` and inspect the file located by `orx
     /// later state advances the row the way the watcher would.
     fn spawn_row(store: &Store, child: &str, parent: &str, state: ChatSpawnState) {
         store
-            .create_chat_spawn(&crate::store::ChatSpawn {
-                session_id: child.into(),
-                parent_session_id: parent.into(),
-                prompt: "Sweep the literature".into(),
-                wake_parent: true,
-                attempts: 0,
-                finished_at: None,
-                kind: crate::store::ChatSpawnKind::Spawn,
-            })
+            .create_chat_spawn(
+                &crate::store::ChatSpawn {
+                    session_id: child.into(),
+                    parent_session_id: parent.into(),
+                    prompt: "Sweep the literature".into(),
+                    wake_parent: true,
+                    attempts: 0,
+                    finished_at: None,
+                    kind: crate::store::ChatSpawnKind::Spawn,
+                },
+                i64::MAX,
+            )
             .unwrap();
         if matches!(state, ChatSpawnState::Running) {
             let token = store
