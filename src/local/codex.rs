@@ -354,8 +354,13 @@ impl CodexClient {
         }
         #[cfg(windows)]
         match self.job.as_ref() {
-            // Kills the wrapper and every descendant it spawned, at once.
-            Some(job) => windows_job::terminate(job),
+            // Kills the wrapper and every descendant it spawned, at once,
+            // then waits them out: the replacement's thread/resume must not
+            // race a still-exiting writer lock holder.
+            Some(job) => {
+                windows_job::terminate(job);
+                windows_job::drain(job).await;
+            }
             // Job enrollment failed at spawn — best-effort tree kill.
             None => {
                 if let Some(pid) = child.id() {
@@ -1055,20 +1060,17 @@ impl CodexHost {
 mod windows_job {
     use std::io;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use std::time::Duration;
 
     use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
     };
     use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-        SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    };
-    #[cfg(test)]
-    use windows_sys::Win32::System::JobObjects::{
-        JobObjectBasicAccountingInformation, QueryInformationJobObject,
-        JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicAccountingInformation,
+        JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
+        TerminateJobObject, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
     use windows_sys::Win32::System::Threading::{
         OpenThread, ResumeThread, CREATE_NO_WINDOW, CREATE_SUSPENDED, THREAD_SUSPEND_RESUME,
@@ -1174,9 +1176,25 @@ mod windows_job {
     /// Kill every process the job confines — npm wrapper and all descendants.
     pub(super) fn terminate(job: &OwnedHandle) {
         // SAFETY: our job handle; terminating an already-empty job is a no-op.
-        unsafe {
-            TerminateJobObject(job.as_raw_handle(), 1);
+        if unsafe { TerminateJobObject(job.as_raw_handle(), 1) } == 0 {
+            eprintln!(
+                "orx up: codex app-server job terminate failed: {}",
+                io::Error::last_os_error()
+            );
         }
+    }
+
+    /// Wait until the job's tree is empty — the wrapper's exit does not mean
+    /// its descendants finished exiting, and the native app-server must be
+    /// fully gone (writer lock released) before a replacement resumes.
+    pub(super) async fn drain(job: &OwnedHandle) {
+        for _ in 0..250 {
+            if active_processes(job) == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        eprintln!("orx up: timed out draining codex app-server's process tree");
     }
 
     /// Fallback for an unenrolled child: `taskkill /T` the tree. `/T` fails if
@@ -1192,9 +1210,8 @@ mod windows_job {
             .status();
     }
 
-    /// Processes still confined by the job — the tests assert teardown
-    /// empties it.
-    #[cfg(test)]
+    /// Processes still confined by the job — `drain` waits for this to reach
+    /// zero, and the tests assert teardown empties it.
     pub(super) fn active_processes(job: &OwnedHandle) -> u32 {
         let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
         // SAFETY: info is writable and its size matches the class requested.
@@ -1449,21 +1466,28 @@ mod tests {
             .expect("job enrollment should succeed");
         let client = windows_test_client(child, Some(job));
 
-        client.terminate().await;
-        // A second call must not signal the (possibly reused) job again.
-        client.terminate().await;
-        assert!(client.terminated.load(Ordering::Acquire));
-
+        // Terminating before the wrapper spawns its native child would prove
+        // nothing — wait for the tree to hold both.
         let job = client.job.as_ref().unwrap();
-        let mut active = u32::MAX;
-        for _ in 0..50 {
-            active = windows_job::active_processes(job);
-            if active == 0 {
+        let mut populated = false;
+        for _ in 0..250 {
+            if windows_job::active_processes(job) >= 2 {
+                populated = true;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert_eq!(active, 0, "the wrapper's native child survived terminate");
+        assert!(populated, "the wrapper never spawned its native child");
+
+        client.terminate().await;
+        // A second call must not signal the (possibly reused) job again.
+        client.terminate().await;
+        assert!(client.terminated.load(Ordering::Acquire));
+        assert_eq!(
+            windows_job::active_processes(job),
+            0,
+            "the wrapper's native child survived terminate"
+        );
     }
 
     #[test]
