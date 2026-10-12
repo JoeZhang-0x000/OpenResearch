@@ -1929,9 +1929,6 @@ export interface ChatSession {
   reasoningLevel: string | null;
   /** Hidden from the default Recents list, but fully intact and resumable. */
   archived: boolean;
-  /** Session whose agent spawned this one with `orx agent spawn`; null for
-   * sessions the user started themselves. */
-  parentSessionId?: string | null;
   /** Chat this side chat branched from. Side chats share its worktree and
    * stay out of history; closing the tab deletes one. */
   sideParentSessionId?: string | null;
