@@ -154,7 +154,12 @@ async fn wait(
         )),
         (Some(exp_id), None) => {
             let plane = crate::plane::local_plane::retry_on_db_lock(
-                || resolve_experiment(Store::open()?, &exp_id),
+                || {
+                    let store = Store::open_with_busy_timeout(
+                        crate::plane::local_plane::busy_timeout_left(deadline),
+                    )?;
+                    resolve_experiment(store, &exp_id)
+                },
                 interval,
                 deadline,
             )
@@ -163,7 +168,12 @@ async fn wait(
         }
         (None, Some(project_id)) => {
             let plane = crate::plane::local_plane::retry_on_db_lock(
-                || resolve_project(Store::open()?, &project_id),
+                || {
+                    let store = Store::open_with_busy_timeout(
+                        crate::plane::local_plane::busy_timeout_left(deadline),
+                    )?;
+                    resolve_project(store, &project_id)
+                },
                 interval,
                 deadline,
             )
