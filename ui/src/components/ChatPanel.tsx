@@ -6150,11 +6150,15 @@ export function ChatPanel({
 
   const openSpawnedSession = useCallback(
     async (sessionId: string) => {
+      const visit = projectVisitRef.current;
+      const scope = composerScopeRef.current;
       try {
         const session = await getChatSession(sessionId);
+        if (projectVisitRef.current !== visit || composerScopeRef.current !== scope) return;
         setSessionFilter("all");
         onActiveSessionChange(sessionId, { projectId: session.projectId });
       } catch (error) {
+        if (projectVisitRef.current !== visit || composerScopeRef.current !== scope) return;
         showAlert(error instanceof Error ? error.message : String(error), "error");
       }
     },
