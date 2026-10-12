@@ -182,7 +182,7 @@ const S_GIT: AgentSkill = AgentSkill {
 };
 const S_AGENT_DELEGATION: AgentSkill = AgentSkill {
     name: "orx-agent-delegation",
-    description: "Delegate independent work to helper agent sessions with `orx agent spawn` and follow up in the same session with `orx agent send`: task selection, self-contained briefs, branch ownership, compute authorization, wakeups, and nesting or concurrency constraints. Use before spawning a helper, sending it a follow-up, or interpreting its result; do not delegate the literature retrieval loop.",
+    description: "Create independent project chats with `orx agent spawn` and follow up in the same chat with `orx agent send`, using the user's New Chat settings. Covers standalone opening messages, follow-ups, project selection, worktrees, and compute authorization. Use before creating another chat or messaging an existing one.",
     content: AGENT_DELEGATION,
     resources: &[],
 };
