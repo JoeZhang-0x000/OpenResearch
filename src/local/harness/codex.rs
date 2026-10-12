@@ -3027,6 +3027,15 @@ async fn run_turn_app_server(ctx: &mut TurnCtx) -> Result<()> {
                     // streaming) is settled, never surfaced — with the reply
                     // shape its method can actually parse.
                     settle_request(&client, &id, kind).await;
+                } else if ctx.spawned_helper {
+                    // A spawned helper has no user to answer cards: an
+                    // unanswered request idles until codex's own approval
+                    // deadline (minutes), by which point the model has already
+                    // stopped reasoning and the turn "finishes" having done
+                    // nothing. Settle it in the shape the method needs instead
+                    // of surfacing a card (same semantics as the turn-exit
+                    // sweep: approval → decline, userInput → empty answers).
+                    settle_request(&client, &id, kind).await;
                 } else {
                     match kind {
                         ServerReqKind::Approval => {
