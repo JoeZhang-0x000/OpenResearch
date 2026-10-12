@@ -812,7 +812,7 @@
   "common_more_count": "{count}+ مورد دیگر",
   "a11y_hide_additional": "پنهان کردن موارد بیشترِ {target}",
   "a11y_show_more_targets": "نمایش {count} مورد دیگر از {target}",
-  "chat_agent_number": "عامل {number}",
+  "chat_agent_number": "گفتگو {number}",
   "chat_agent_sessions": "نشست‌های عامل‌ها",
   "chat_run_logs": "گزارش‌های اجرا",
   "chat_experiments": "آزمایش‌ها",

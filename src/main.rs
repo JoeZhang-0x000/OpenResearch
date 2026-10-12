@@ -76,7 +76,7 @@ enum Command {
     /// Operate on one local project.
     Project(ProjectArgs),
 
-    /// Delegate a task to a second agent session.
+    /// Create independent project chats.
     Agent(AgentArgs),
 
     /// List a project's runs.
@@ -944,7 +944,7 @@ pub struct PaperArgs {
 fn explain_removed_spawn_flags(mut error: clap::Error) -> clap::Error {
     use clap::error::{ContextKind, ContextValue, ErrorKind};
     if error.kind() == ErrorKind::UnknownArgument
-        && error.to_string().contains("orx agent spawn")
+        && error.to_string().contains(" agent spawn")
         && matches!(error.get(ContextKind::InvalidArg), Some(ContextValue::String(flag)) if ["--harness", "--model", "--no-wake"].contains(&flag.split('=').next().unwrap_or(flag)))
     {
         error.insert(ContextKind::Suggested, ContextValue::StyledStrs(vec![
@@ -1437,13 +1437,15 @@ mod cli_tests {
 
     #[test]
     fn agent_spawn_rejects_removed_settings_flags() {
-        for flag in ["--harness", "--model", "--no-wake"] {
-            let error = Cli::try_parse_from(["orx", "agent", "spawn", "task", flag])
-                .expect_err("removed flag");
-            assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
-            assert!(explain_removed_spawn_flags(error)
-                .to_string()
-                .contains("saved New Chat settings"));
+        for program in ["orx", "orx.exe"] {
+            for flag in ["--harness", "--model", "--model=legacy", "--no-wake"] {
+                let error = Cli::try_parse_from([program, "agent", "spawn", "task", flag])
+                    .expect_err("removed flag");
+                assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+                assert!(explain_removed_spawn_flags(error)
+                    .to_string()
+                    .contains("saved New Chat settings"));
+            }
         }
         assert!(Cli::try_parse_from(["orx", "agent", "spawn", "task", "--project", "p1"]).is_ok());
     }

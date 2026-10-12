@@ -812,7 +812,7 @@
   "common_more_count": "另有 {count} 项",
   "a11y_hide_additional": "隐藏其余{target}",
   "a11y_show_more_targets": "再显示 {count} 个{target}",
-  "chat_agent_number": "智能体 {number}",
+  "chat_agent_number": "聊天 {number}",
   "chat_agent_sessions": "智能体会话",
   "chat_run_logs": "运行日志",
   "chat_experiments": "实验",

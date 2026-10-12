@@ -85,6 +85,7 @@ import {
   cancelQueuedMessage,
   chatAttachmentUrl,
   createChatSession,
+  getChatSession,
   deleteChatSession,
   DEMO_FIGURE_SESSION_ID,
   DEMO_LITERATURE_SESSION_ID,
@@ -6147,11 +6148,15 @@ export function ChatPanel({
     }
   }, [projectId, onActiveSessionChange]);
 
-  /** Follow a spawn card and reveal its session in the rail. */
   const openSpawnedSession = useCallback(
-    (sessionId: string) => {
-      setSessionFilter("all");
-      onActiveSessionChange(sessionId);
+    async (sessionId: string) => {
+      try {
+        const session = await getChatSession(sessionId);
+        setSessionFilter("all");
+        onActiveSessionChange(sessionId, { projectId: session.projectId });
+      } catch (error) {
+        showAlert(error instanceof Error ? error.message : String(error), "error");
+      }
     },
     [onActiveSessionChange],
   );

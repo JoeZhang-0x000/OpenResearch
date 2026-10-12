@@ -26,25 +26,16 @@ pub async fn run(args: crate::AgentArgs) -> Result<()> {
                         "Pass --project <project-id> when there is no current OpenResearch chat."
                     )
                     })?;
-                    let sessions = crate::commands::up::chat_request_via_up(
+                    let session = crate::commands::up::chat_request_via_up(
                         port,
                         reqwest::Method::GET,
-                        "/api/chat/sessions?scope=all",
+                        &format!("/api/chat/sessions/{session_id}"),
                         &serde_json::json!({}),
                     )
                     .await?;
-                    sessions
-                        .get("sessions")
-                        .and_then(serde_json::Value::as_array)
-                        .and_then(|sessions| {
-                            sessions.iter().find(|session| {
-                                session.get("id").and_then(serde_json::Value::as_str)
-                                    == Some(&session_id)
-                            })
-                        })
-                        .and_then(|session| {
-                            session.get("projectId").and_then(serde_json::Value::as_str)
-                        })
+                    session
+                        .pointer("/session/projectId")
+                        .and_then(serde_json::Value::as_str)
                         .ok_or_else(|| {
                             anyhow!("The current chat is unavailable. Pass --project <project-id>.")
                         })?

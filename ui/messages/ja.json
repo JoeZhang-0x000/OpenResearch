@@ -818,7 +818,7 @@
   "common_more_count": "+ 他 {count} 件",
   "a11y_hide_additional": "追加の {target} を非表示",
   "a11y_show_more_targets": "{target} をさらに {count} 件表示",
-  "chat_agent_number": "エージェント {number}",
+  "chat_agent_number": "チャット {number}",
   "chat_agent_sessions": "エージェントのセッション",
   "chat_run_logs": "実行ログ",
   "chat_experiments": "実験",

@@ -818,7 +818,7 @@
   "common_more_count": "+ {count} और",
   "a11y_hide_additional": "अतिरिक्त {target} छिपाएं",
   "a11y_show_more_targets": "{count} और {target} दिखाएं",
-  "chat_agent_number": "एजेंट {number}",
+  "chat_agent_number": "चैट {number}",
   "chat_agent_sessions": "एजेंट सेशन",
   "chat_run_logs": "रन लॉग",
   "chat_experiments": "प्रयोग",

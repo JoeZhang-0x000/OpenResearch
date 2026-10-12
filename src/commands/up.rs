@@ -759,7 +759,9 @@ fn router(state: AppState, remote_auth: Option<RemoteAuth>) -> Router {
         )
         .route(
             "/api/chat/sessions/{id}",
-            axum::routing::delete(delete_chat_session).patch(update_chat_session),
+            get(get_chat_session)
+                .delete(delete_chat_session)
+                .patch(update_chat_session),
         )
         .route("/api/chat/sessions/{id}/messages", get(chat_messages))
         .route("/api/chat/sessions/{id}/worktree", get(session_worktree))
@@ -7368,6 +7370,16 @@ fn new_chat_settings(
     })
 }
 
+async fn get_chat_session(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult {
+    let session = Store::open()?
+        .get_chat_session(&id)?
+        .ok_or_else(|| not_found("chat session"))?;
+    let busy = state.chat.is_busy(&id).await;
+    Ok(Json(
+        json!({ "session": local::chat::session_json(&session, busy) }),
+    ))
+}
+
 async fn create_chat_session(
     State(state): State<AppState>,
     Json(mut req): Json<CreateChatSessionReq>,
@@ -8444,9 +8456,13 @@ mod tests {
 
     #[test]
     fn new_chat_falls_back_only_when_no_preference_exists() {
-        let dir = std::env::temp_dir().join(format!("orx-defaults-{}", uuid::Uuid::new_v4()));
-        let store = Store::open_at(dir.clone()).unwrap();
-        let mut preferences = store.ui_state().unwrap();
+        let mut preferences = crate::store::StoredUiState {
+            onboarding_completed: false,
+            tour_completed: false,
+            workspace: None,
+            preferred_autonomy: None,
+            preferred_agent: None,
+        };
         let catalog = json!({"harnesses": [{"id":"claude-code", "agentReady":true,
             "models":[{"id":"opus"}], "options":{"defaultPermissionMode":"plan", "reasoningLevels":[{"id":"default"}]}}]});
         let req = new_chat_settings("project".into(), preferences.clone(), &catalog).unwrap();
@@ -8474,7 +8490,6 @@ mod tests {
             reasoning_level: None,
         });
         assert!(new_chat_settings("project".into(), preferences, &catalog).is_err());
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

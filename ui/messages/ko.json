@@ -818,7 +818,7 @@
   "common_more_count": "+ {count}개 더",
   "a11y_hide_additional": "추가 {target} 숨기기",
   "a11y_show_more_targets": "{target} {count}개 더 표시",
-  "chat_agent_number": "에이전트 {number}",
+  "chat_agent_number": "채팅 {number}",
   "chat_agent_sessions": "에이전트 세션",
   "chat_run_logs": "실행 로그",
   "chat_experiments": "실험",

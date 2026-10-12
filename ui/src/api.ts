@@ -1997,6 +1997,9 @@ export const createChatSession = (
     (r) => r.session,
   );
 
+export const getChatSession = (sessionId: string) =>
+  get<{ session: ChatSession }>(`/api/chat/sessions/${sessionId}`).then((r) => r.session);
+
 export const deleteChatSession = (sessionId: string) =>
   writeResponse(`/api/chat/sessions/${sessionId}`, { method: "DELETE" }).then((r) =>
     json<{ ok: boolean }>(r).then((result) => { removeSession(sessionId); return result; }),

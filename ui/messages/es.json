@@ -818,7 +818,7 @@
   "common_more_count": "+ {count} más",
   "a11y_hide_additional": "Ocultar {target} adicionales",
   "a11y_show_more_targets": "Mostrar {count} {target} más",
-  "chat_agent_number": "agente {number}",
+  "chat_agent_number": "chat {number}",
   "chat_agent_sessions": "sesiones de agente",
   "chat_run_logs": "logs de ejecución",
   "chat_experiments": "experimentos",

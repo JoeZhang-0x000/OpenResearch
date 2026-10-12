@@ -817,7 +817,7 @@
   "common_more_count": "المزيد (+{count})",
   "a11y_hide_additional": "إخفاء {target} الإضافية",
   "a11y_show_more_targets": "عرض المزيد من {target} ({count})",
-  "chat_agent_number": "وكيل {number}",
+  "chat_agent_number": "محادثة {number}",
   "chat_agent_sessions": "جلسات الوكلاء",
   "chat_run_logs": "سجلات التشغيل",
   "chat_experiments": "التجارب",
