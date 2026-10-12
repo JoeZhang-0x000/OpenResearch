@@ -374,8 +374,18 @@ impl LocalPlane {
         let store = &self.store;
         let exp_id = &self.id;
         let mut last_status: Option<String> = None;
+        let mut lock_notified = false;
         loop {
-            match store.latest_run_for_experiment(exp_id)? {
+            let run = match store.latest_run_for_experiment(exp_id) {
+                Ok(run) => run,
+                Err(error) if is_db_locked(&error) => {
+                    note_db_locked(&mut lock_notified);
+                    sleep_until_or_timeout(interval, deadline).await?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            match run {
                 None => {
                     if last_status.is_none() {
                         eprintln!("No run yet for this experiment — waiting for one to start…");
@@ -404,11 +414,15 @@ impl LocalPlane {
     pub async fn wait_project(&self, interval: Duration, deadline: Instant) -> Result<()> {
         let store = &self.store;
         let project_id = &self.id;
-        let snapshot: HashMap<String, String> = store
-            .list_runs_by_project(project_id)?
-            .into_iter()
-            .map(|r| (r.id, r.status))
-            .collect();
+        let snapshot: HashMap<String, String> = retry_on_db_lock(
+            || store.list_runs_by_project(project_id),
+            interval,
+            deadline,
+        )
+        .await?
+        .into_iter()
+        .map(|r| (r.id, r.status))
+        .collect();
         let in_flight = snapshot
             .values()
             .filter(|s| !crate::local::is_terminal(s))
@@ -429,10 +443,18 @@ impl LocalPlane {
             in_flight
         );
 
+        let mut lock_notified = false;
         loop {
             sleep_until_or_timeout(interval, deadline).await?;
 
-            let current = store.list_runs_by_project(project_id)?;
+            let current = match store.list_runs_by_project(project_id) {
+                Ok(current) => current,
+                Err(error) if is_db_locked(&error) => {
+                    note_db_locked(&mut lock_notified);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             let mut completed: Vec<(String, Option<String>)> = Vec::new();
             for r in &current {
                 if !crate::local::is_terminal(&r.status) {
@@ -548,6 +570,40 @@ impl LocalPlane {
     }
 }
 
+/// True when `error` is a transient SQLite lock ("database is locked") —
+/// contention a wait command should outlast, not die on.
+pub(crate) fn is_db_locked(error: &crate::error::Error) -> bool {
+    matches!(
+        error.downcast_ref::<rusqlite::Error>(),
+        Some(rusqlite::Error::SqliteFailure(failure, _))
+            if failure.code == rusqlite::ErrorCode::DatabaseBusy
+    )
+}
+
+fn note_db_locked(notified: &mut bool) {
+    if !*notified {
+        eprintln!("orx.db is locked by another process — retrying within the wait timeout…");
+        *notified = true;
+    }
+}
+
+/// Run `attempt`, retrying while the store reports a transient lock, until
+/// `deadline` — after which it reports the wait's usual timeout error.
+pub(crate) async fn retry_on_db_lock<T>(
+    mut attempt: impl FnMut() -> Result<T>,
+    interval: Duration,
+    deadline: Instant,
+) -> Result<T> {
+    let mut notified = false;
+    loop {
+        match attempt() {
+            Err(error) if is_db_locked(&error) => note_db_locked(&mut notified),
+            other => return other,
+        }
+        sleep_until_or_timeout(interval, deadline).await?;
+    }
+}
+
 async fn sleep_until_or_timeout(interval: Duration, deadline: Instant) -> Result<()> {
     if Instant::now() >= deadline {
         return Err(anyhow!("Timed out waiting for a run state change."));
@@ -558,4 +614,28 @@ async fn sleep_until_or_timeout(interval: Duration, deadline: Instant) -> Result
         return Err(anyhow!("Timed out waiting for a run state change."));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_db_locked_matches_only_sqlite_busy() {
+        let busy: crate::error::Error = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            Some("database is locked".to_string()),
+        )
+        .into();
+        assert!(is_db_locked(&busy));
+
+        let busy_snapshot: crate::error::Error = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY_SNAPSHOT),
+            None,
+        )
+        .into();
+        assert!(is_db_locked(&busy_snapshot));
+
+        assert!(!is_db_locked(&anyhow!("some other error")));
+    }
 }
