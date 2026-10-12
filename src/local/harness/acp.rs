@@ -20,6 +20,23 @@ use crate::store::Store;
 
 pub struct Acp(pub Definition);
 
+impl Acp {
+    fn detection(&self) -> HarnessInfo {
+        let mut info = HarnessInfo::new(self.id(), self.name());
+        info.bin_path = crate::local::acp::executable_path(&self.0.executable)
+            .map(|path| path.to_string_lossy().into_owned());
+        info.installed = info.bin_path.is_some();
+        if let Some(preset) = crate::local::acp::presets()
+            .into_iter()
+            .find(|preset| preset.launch.id == self.0.id)
+        {
+            info.setup_url = Some(preset.setup_url);
+            info.needs_connection_adapter = preset.needs_connection_adapter;
+        }
+        info
+    }
+}
+
 #[async_trait]
 impl Harness for Acp {
     fn id(&self) -> &str {
@@ -33,11 +50,14 @@ impl Harness for Acp {
     }
 
     async fn detect_snapshot(&self) -> Option<HarnessInfo> {
-        Some(HarnessInfo::new(self.id(), self.name()))
+        Some(self.detection())
     }
 
     async fn detect(&self) -> Option<HarnessInfo> {
-        let mut info = HarnessInfo::new(self.id(), self.name());
+        let mut info = self.detection();
+        if !info.installed && info.setup_url.is_some() {
+            return Some(info);
+        }
         match crate::local::acp::test_connection(&self.0).await {
             Ok(connection) => {
                 info.installed = true;

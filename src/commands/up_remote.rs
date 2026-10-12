@@ -208,8 +208,7 @@ impl RemoteSessionManager {
             ui_preferences: preferences,
             can_start_new_host: false,
         };
-        let client = reqwest::Client::builder()
-            .no_proxy()
+        let client = crate::net::loopback_client()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(5))
             .http1_only()
@@ -1021,9 +1020,18 @@ async fn connect_once(
         return ConnectionEnd::Cancelled;
     }
 
+    let sharing = crate::jobs::ssh::setup_connection_sharing(&session.target);
+    tokio::pin!(sharing);
+    let mut sharing_pending = true;
     let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
     loop {
         tokio::select! {
+            warning = &mut sharing, if sharing_pending => {
+                sharing_pending = false;
+                if let Some(warning) = warning {
+                    eprintln!("orx: warning: {warning}");
+                }
+            }
             status = child.wait() => {
                 return ConnectionEnd::Retryable(match status {
                     Ok(status) => format!("SSH connection ended ({status})."),
@@ -2245,6 +2253,7 @@ pub(crate) fn ssh_forward_command(
     remote_cmd: &str,
 ) -> Result<Command> {
     let mut cmd = Command::new("ssh");
+    cmd.env("ORX_SSH_PROBE", "1");
     cmd.args(crate::jobs::ssh::forward_args(target, forward, remote_cmd)?)
         .stdin(Stdio::null())
         .kill_on_drop(true);
@@ -2276,7 +2285,7 @@ mod tests {
     fn sample_session() -> RemoteSession {
         RemoteSession {
             target: parse_remote_target("example"),
-            client: reqwest::Client::new(),
+            client: crate::net::loopback_client().build().unwrap(),
             info: RwLock::new(RemoteSessionInfo {
                 id: "session".into(),
                 host: "example".into(),

@@ -31,7 +31,7 @@ export const DEMO_SEEDED_LEAF_IDS: Record<string, string> = {
   [DEMO_LITERATURE_SESSION_ID]: "msg_demo_nanochat_literature_assistant_v1",
 };
 export const DEMO_RUN_EXPERIMENT_PROMPT =
-  "Run the Muon matrix LR 2× probe experiment. When it finishes, compare its step-100 and step-200 val_bpb against the baseline and tell me whether doubling the matrix learning rate helps early training.";
+  "Run the proposed learning-rate probe experiment. Summarize its results using the recorded validation metric and comparison described by the experiment. If it produces an interactive HTML loss chart, show it inline using image syntax.";
 
 export class FileChangedError extends Error {
   readonly currentVersion: string | null;
@@ -202,6 +202,7 @@ export interface ProjectActivity {
   runningExperiments: number;
   totalExperiments: number;
   lastMessageAt: number | null;
+  lastActivityAt: number;
 }
 
 export const listProjectActivity = (signal?: AbortSignal) =>
@@ -254,6 +255,8 @@ export const completeOnboarding = (selection: OnboardingSelection, profile: Prof
 
 export interface ProjectPathStatus {
   gitVersion: string | null;
+  /** Only without a path: Windows with no Git, which `installGit` can fix. */
+  gitInstallable?: boolean;
   resolvedPath: string | null;
   exists: boolean | null;
   directory: boolean | null;
@@ -268,6 +271,8 @@ export const getProjectPathStatus = (path = "", signal?: AbortSignal) => {
   const query = path ? `?path=${encodeURIComponent(path)}` : "";
   return get<ProjectPathStatus>(`/api/project-path/status${query}`, signal);
 };
+
+export const installGit = () => post<Record<string, never>>("/api/git/install");
 
 export const pickProjectFolder = () =>
   post<{ path: string | null }>("/api/project-path/pick").then((result) => result.path);
@@ -374,10 +379,6 @@ export const getProjectStarterPrompts = (
     `/api/projects/${projectId}/starter-prompts?${new URLSearchParams({ harness, ...(model ? { model } : {}), locale })}`,
     signal,
   );
-
-/** Record a visit so the backend can persist project-level UI recency. */
-export const openProject = (projectId: string) =>
-  post<{ project: Project }>(`/api/projects/${projectId}/open`).then((r) => r.project);
 
 export const deleteProject = (projectId: string) =>
   writeResponse(`/api/projects/${projectId}`, { method: "DELETE" }).then(async (r) => {
@@ -1122,6 +1123,10 @@ export interface SlurmSettings {
   partition: string | null;
   account: string | null;
   timeLimit: string | null;
+  /** `--cpus-per-task` default; null = the partition decides (often one core). */
+  cpusPerTask: number | null;
+  /** `--mem` default in Slurm syntax ("64G"); null = the partition decides. */
+  mem: string | null;
   /** Login-node candidates, from ~/.ssh/config (same source as SSH). */
   hosts: SshHost[];
 }
@@ -1134,6 +1139,9 @@ export const saveSlurmSettings = (body: {
   partition?: string;
   account?: string;
   timeLimit?: string;
+  /** 0 clears it back to the partition default. */
+  cpusPerTask?: number;
+  mem?: string;
 }) => post<SlurmSettings>("/api/settings/slurm", body);
 
 export interface SlurmPreflight {
@@ -1538,6 +1546,8 @@ export interface HarnessModel {
   defaultReasoningLevel?: string;
   /** Additional processing tiers this model advertises (Codex Fast mode). */
   serviceTiers?: OptionChoice[];
+  /** Whether the model accepts images; absent when the catalog doesn't say. */
+  imageInput?: boolean;
 }
 
 /** Display label for a harness model: the catalog's own name when it has one,
@@ -1691,6 +1701,8 @@ export interface Harness {
   plan?: string;
   agentReady: boolean;
   agentNote?: string;
+  setupUrl?: string;
+  needsConnectionAdapter?: boolean;
   /** Setup is blocked by something no install/update/login command repairs —
    * an environment credential overriding the saved login, a database the CLI
    * will not open. `agentNote` carries the repair; offer no setup button. */
@@ -1735,6 +1747,8 @@ export interface AcpDefinition {
 }
 
 export const listAcpHarnesses = () => get<AcpDefinition[]>("/api/harnesses/acp");
+export interface AcpPreset extends AcpDefinition { setupUrl: string; needsConnectionAdapter: boolean }
+export const listAcpPresets = () => get<AcpPreset[]>("/api/harnesses/acp/presets");
 export const saveAcpHarness = (definition: Omit<AcpDefinition, "id">, id?: string) => id
   ? put<AcpDefinition>(`/api/harnesses/acp/${encodeURIComponent(id)}`, definition)
   : post<AcpDefinition>("/api/harnesses/acp", definition);
@@ -1938,9 +1952,6 @@ export interface ChatSession {
   reasoningLevel: string | null;
   /** Hidden from the default Recents list, but fully intact and resumable. */
   archived: boolean;
-  /** Session whose agent spawned this one with `orx agent spawn`; null for
-   * sessions the user started themselves. */
-  parentSessionId?: string | null;
   /** Chat this side chat branched from. Side chats share its worktree and
    * stay out of history; closing the tab deletes one. */
   sideParentSessionId?: string | null;
@@ -1982,6 +1993,15 @@ export const importNativeChat = (projectId: string, chat: NativeChat) =>
 export const listAllChatSessions = (signal?: AbortSignal) =>
   get<{ sessions: ChatSession[] }>("/api/chat/sessions?scope=all", signal).then((r) => r.sessions);
 
+export interface SidebarChatCursor { updatedAt: number; id: string }
+export interface SidebarChatPage { sessions: ChatSession[]; next: SidebarChatCursor | null }
+export const listSidebarChatSessions = (filter: "active" | "archived" | "all", before: SidebarChatCursor | null, signal?: AbortSignal) => {
+  const params = new URLSearchParams({ scope: "sidebar" });
+  if (filter !== "all") params.set("archived", String(filter === "archived"));
+  if (before) { params.set("beforeUpdatedAt", String(before.updatedAt)); params.set("beforeId", before.id); }
+  return get<SidebarChatPage>(`/api/chat/sessions?${params}`, signal);
+};
+
 /** Per-session (and per-turn) composer selections beyond the harness itself. */
 export interface TurnOptions {
   model?: string | null;
@@ -1999,6 +2019,9 @@ export const createChatSession = (
   post<{ session: ChatSession }>("/api/chat/sessions", { projectId, harness, ...opts }).then(
     (r) => r.session,
   );
+
+export const getChatSession = (sessionId: string) =>
+  get<{ session: ChatSession }>(`/api/chat/sessions/${sessionId}`).then((r) => r.session);
 
 export const deleteChatSession = (sessionId: string) =>
   writeResponse(`/api/chat/sessions/${sessionId}`, { method: "DELETE" }).then((r) =>

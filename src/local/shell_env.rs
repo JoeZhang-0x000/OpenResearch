@@ -14,13 +14,13 @@
 //! to the process environment unchanged. The Linux AppImage also hands host
 //! programs the session's GTK settings ([`host_gui_env`]).
 //!
-//! Scope is orx's own resolution, the children it spawns, and the dashboard's
-//! PTY terminals. The other things orx shells out to — `git`, `kubectl`, and
-//! `ssh` — still inherit the process environment.
+//! Scope is orx's own resolution, the children it spawns (including `git`), and
+//! the dashboard's PTY terminals. `kubectl` and `ssh` still inherit the process
+//! environment.
 
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 /// Deliberately short. These are the variables whose divergence makes the app
@@ -51,8 +51,110 @@ pub fn var(key: &str) -> Option<OsString> {
 }
 
 /// The PATH to search for the binaries orx spawns, and to hand its children.
+#[cfg(not(windows))]
 pub fn search_path() -> Option<OsString> {
     var("PATH")
+}
+
+/// The PATH to search, extended by the registry's current PATH so a tool installed
+/// while orx runs is found without a restart, then by the Git orx installs.
+#[cfg(windows)]
+pub fn search_path() -> Option<OsString> {
+    let base = var("PATH");
+    let mut path = base.clone().unwrap_or_default();
+    let mut seen: Vec<String> = std::env::split_paths(&path)
+        .map(|dir| path_key(&dir))
+        .collect();
+    let added = registry_path()
+        .into_iter()
+        .chain(super::portable_git::cmd_dir())
+        .filter(|dir| dir.is_absolute());
+    for dir in added {
+        let key = path_key(&dir);
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        if !path.is_empty() {
+            path.push(PATH_LIST_SEPARATOR);
+        }
+        path.push(dir);
+    }
+    (base.is_some() || !path.is_empty()).then_some(path)
+}
+
+/// Windows paths compare case-insensitively, with or without a trailing separator.
+#[cfg(windows)]
+fn path_key(dir: &std::path::Path) -> String {
+    dir.to_string_lossy()
+        .trim_end_matches(['\\', '/'])
+        .to_lowercase()
+}
+
+/// The machine then user `Path`, as a new process would compose them, expanded.
+#[cfg(windows)]
+fn registry_path() -> Vec<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::Foundation::{ERROR_MORE_DATA, ERROR_SUCCESS};
+    use windows_sys::Win32::System::Registry::{
+        RegGetValueW, HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ,
+    };
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(Some(0)).collect()
+    }
+    fn read(root: HKEY, key: &str) -> Option<OsString> {
+        let (key, value) = (wide(key), wide("Path"));
+        let mut buffer = vec![0u16; 4096];
+        // Expansion can outgrow the size a first call reports, so retry on ERROR_MORE_DATA.
+        for _ in 0..3 {
+            let mut bytes = u32::try_from(buffer.len() * 2).ok()?;
+            // SAFETY: both names are NUL-terminated and `bytes` is the buffer's size.
+            let status = unsafe {
+                RegGetValueW(
+                    root,
+                    key.as_ptr(),
+                    value.as_ptr(),
+                    // Expanding (no RRF_NOEXPAND) returns REG_EXPAND_SZ as REG_SZ;
+                    // naming RRF_RT_REG_EXPAND_SZ here fails with ERROR_INVALID_PARAMETER.
+                    RRF_RT_REG_SZ,
+                    std::ptr::null_mut(),
+                    buffer.as_mut_ptr().cast(),
+                    &mut bytes,
+                )
+            };
+            match status {
+                ERROR_SUCCESS => {
+                    buffer.truncate(bytes as usize / 2);
+                    return Some(OsString::from_wide(until_nul(&buffer)));
+                }
+                ERROR_MORE_DATA => buffer.resize((bytes as usize).div_ceil(2) + 1, 0),
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    [
+        (
+            HKEY_LOCAL_MACHINE,
+            r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+        ),
+        (HKEY_CURRENT_USER, "Environment"),
+    ]
+    .into_iter()
+    .filter_map(|(root, key)| read(root, key))
+    .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+    .collect()
+}
+
+/// The string before its terminator. An expanded value's reported size can run
+/// past it, and a NUL left in PATH makes every spawn fail ("nul byte found").
+#[cfg(any(windows, test))]
+fn until_nul(wide: &[u16]) -> &[u16] {
+    wide.iter()
+        .position(|&unit| unit == 0)
+        .map_or(wide, |end| &wide[..end])
 }
 
 /// What separates PATH entries when composing one for a child.
@@ -66,6 +168,21 @@ pub const PATH_LIST_SEPARATOR: &str = ";";
 /// symlink composes with `resolve_symlinks`.
 pub fn find_on_path(binary: &str) -> Option<PathBuf> {
     search_in(&search_path()?, binary)
+}
+
+/// Like `find_on_path`, but on this process's PATH, which a bare `Command::new(binary)` searches.
+pub fn find_on_process_path(binary: &str) -> Option<PathBuf> {
+    search_from(
+        &std::env::var_os("PATH")?,
+        &std::env::current_dir().ok()?,
+        binary,
+    )
+}
+
+/// `search_in`, but with relative entries resolved against `cwd` as a bare command name would be.
+fn search_from(paths: &OsStr, cwd: &Path, binary: &str) -> Option<PathBuf> {
+    let dirs = std::env::split_paths(paths).map(|dir| cwd.join(dir));
+    search_in(&std::env::join_paths(dirs).ok()?, binary)
 }
 
 /// Where `binary` lives inside `dir`, trying the PATHEXT spellings a bare name lacks on Windows.
@@ -88,7 +205,20 @@ fn search_in(paths: &OsStr, binary: &str) -> Option<PathBuf> {
                 .into_iter()
                 .map(move |name| dir.join(name))
         })
-        .find(|candidate| candidate.is_file())
+        .find(|candidate| is_executable(candidate))
+}
+
+/// Like execvp, pass over a non-executable file so a working binary later on PATH wins.
+#[cfg(unix)]
+fn is_executable(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    path.metadata()
+        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable(path: &std::path::Path) -> bool {
+    path.is_file()
 }
 
 /// The filenames `binary` may have inside one PATH directory, in the order to
@@ -219,6 +349,33 @@ pub fn parse_probe(stdout: &str, marker: &str) -> Option<HashMap<&'static str, O
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn process_path_search_resolves_relative_entries_against_cwd() {
+        use std::os::unix::fs::PermissionsExt;
+        let cwd = crate::local::git::TemporaryDirectory::new("orx-path").unwrap();
+        std::fs::create_dir(cwd.path().join("bin")).unwrap();
+        let wrapper = cwd.path().join("bin").join("orx-test-tool");
+        std::fs::write(&wrapper, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            search_from(OsStr::new("bin:/usr/bin"), cwd.path(), "orx-test-tool"),
+            Some(wrapper)
+        );
+        assert_eq!(search_in(OsStr::new("bin:/usr/bin"), "orx-test-tool"), None);
+    }
+
+    #[test]
+    fn a_registry_value_ends_at_its_first_nul() {
+        let wide: Vec<u16> = "C:\\bin\0stale\0\0".encode_utf16().collect();
+        assert_eq!(
+            until_nul(&wide),
+            "C:\\bin".encode_utf16().collect::<Vec<_>>()
+        );
+        let bare: Vec<u16> = "C:\\bin".encode_utf16().collect();
+        assert_eq!(until_nul(&bare), bare.as_slice());
+    }
+
     const M: &str = "__ORX_ENV_abc123__";
 
     /// `parse_probe` insists on one absolute PATH entry, and what counts as
@@ -246,10 +403,20 @@ mod tests {
         std::fs::create_dir_all(&late).expect("late");
         std::fs::write(early.join(TOOL), "").expect("early tool");
         std::fs::write(late.join(TOOL), "").expect("late tool");
+        #[cfg(unix)]
+        for dir in [&early, &late] {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.join(TOOL), std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
 
-        let paths =
-            std::env::join_paths([PathBuf::new(), PathBuf::from("bin"), early.clone(), late])
-                .expect("join");
+        let paths = std::env::join_paths([
+            PathBuf::new(),
+            PathBuf::from("bin"),
+            early.clone(),
+            late.clone(),
+        ])
+        .expect("join");
         assert_eq!(search_in(&paths, "tool"), Some(early.join(TOOL)));
         assert_eq!(search_in(&paths, "absent"), None);
 
@@ -257,6 +424,14 @@ mod tests {
         // tests from the package root, so `src/main.rs` is a real hit here.
         let relative = std::env::join_paths([PathBuf::from("src")]).expect("join");
         assert_eq!(search_in(&relative, "main.rs"), None);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(early.join(TOOL), std::fs::Permissions::from_mode(0o644))
+                .expect("chmod");
+            assert_eq!(search_in(&paths, "tool"), Some(late.join(TOOL)));
+        }
 
         std::fs::remove_dir_all(&root).ok();
     }

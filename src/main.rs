@@ -24,6 +24,7 @@ mod jobs;
 // Local mode (`orx up`): builds out across stages; not all of it is wired yet.
 #[allow(dead_code)]
 mod local;
+mod net;
 mod output;
 mod paths;
 mod plane;
@@ -75,7 +76,7 @@ enum Command {
     /// Operate on one local project.
     Project(ProjectArgs),
 
-    /// Delegate a task to a second agent session.
+    /// Create independent project chats.
     Agent(AgentArgs),
 
     /// List a project's runs.
@@ -373,10 +374,12 @@ pub struct AgentArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum AgentCommand {
-    /// Hand a task to a helper agent running in its own top-level session.
+    /// Create an independent chat using your saved New Chat settings.
+    #[command(
+        after_help = "New chats use your saved New Chat settings. --harness, --model, and --no-wake are no longer supported; created chats never wake the creator."
+    )]
     Spawn {
-        /// What the helper agent should do. Write it as a self-contained brief:
-        /// the helper starts with an empty transcript and cannot see this chat.
+        /// Opening message for the new chat; it starts with an empty transcript.
         task: Option<String>,
         /// Read the task from stdin instead, for long multi-paragraph briefs.
         #[arg(long)]
@@ -384,15 +387,9 @@ pub enum AgentCommand {
         /// Name the session in the sidebar. Defaults to an auto-generated title.
         #[arg(long)]
         title: Option<String>,
-        /// Harness for the helper (defaults to this session's).
+        /// Project ID (defaults to the current OpenResearch chat's project).
         #[arg(long)]
-        harness: Option<String>,
-        /// Model for the helper (defaults to this session's).
-        #[arg(long)]
-        model: Option<String>,
-        /// Do not resume this chat when the helper finishes.
-        #[arg(long)]
-        no_wake: bool,
+        project: Option<String>,
     },
 }
 
@@ -433,6 +430,18 @@ pub enum ExpCommand {
         /// Restore descendants, excluding the selected experiment.
         #[arg(long, group = "unarchive_scope")]
         descendants: bool,
+    },
+
+    /// Re-parent an experiment and its subtree. Only the tree changes; git branches stay put.
+    #[command(group(clap::ArgGroup::new("move_target").required(true)))]
+    Move {
+        exp_id: String,
+        /// New parent experiment in the same project.
+        #[arg(long, group = "move_target")]
+        parent: Option<String>,
+        /// Make the experiment a new root (baseline).
+        #[arg(long, group = "move_target")]
+        baseline: bool,
     },
 
     /// Show the experiment's status, run command, and latest run.
@@ -557,6 +566,18 @@ pub struct ExpRunArgs {
     /// Not supported with `--backend ray` (Ray Jobs have no time limit).
     #[arg(long)]
     pub timeout: Option<String>,
+    /// Cores for the job (with `--backend slurm`): `#SBATCH --cpus-per-task=`.
+    /// Omitted falls back to the slurm settings, then the partition default —
+    /// which on many clusters is a single core, whatever the GPU request.
+    #[arg(long)]
+    pub cpus: Option<u32>,
+    /// Host memory for the job (with `--backend slurm`): `#SBATCH --mem=`, in
+    /// Slurm's own syntax (64G, 4000M, or a bare number for megabytes).
+    /// Omitted falls back to the slurm settings, then the partition default,
+    /// which is usually `DefMemPerCPU` × the core count — so raising `--cpus`
+    /// raises memory with it.
+    #[arg(long)]
+    pub mem: Option<String>,
     /// Launch even when another run is already in flight for this experiment.
     #[arg(long)]
     pub force: bool,
@@ -932,6 +953,19 @@ pub struct PaperArgs {
     pub full: bool,
 }
 
+fn explain_removed_spawn_flags(mut error: clap::Error) -> clap::Error {
+    use clap::error::{ContextKind, ContextValue, ErrorKind};
+    if error.kind() == ErrorKind::UnknownArgument
+        && error.to_string().contains(" agent spawn")
+        && matches!(error.get(ContextKind::InvalidArg), Some(ContextValue::String(flag)) if ["--harness", "--model", "--no-wake"].contains(&flag.split('=').next().unwrap_or(flag)))
+    {
+        error.insert(ContextKind::Suggested, ContextValue::StyledStrs(vec![
+            "New chats use your saved New Chat settings and never wake the creator. Configure the agent and model in OpenResearch.".into()
+        ]));
+    }
+    error
+}
+
 // The default multi-thread runtime is load-bearing for desktop app mode: it
 // blocks the main thread in the window's run loop while the dashboard server runs
 // on worker threads. A `current_thread` flavor would deadlock. See commands::app.
@@ -958,15 +992,17 @@ async fn main() {
     // AppImage's AppRun. See commands::app.
     #[cfg(all(desktop_app, not(target_os = "macos")))]
     if commands::app::launched_with_app_arg() {
-        telemetry::set_flag(false);
+        telemetry::set_flag(std::env::var_os(commands::app::APP_NO_TELEMETRY_ENV).is_some());
         commands::app::run().await;
         return;
     }
 
-    let mut cli = Cli::parse();
-    // Double-clicked from Explorer: start the dashboard, as the macOS .app does.
+    let cli = Cli::try_parse().unwrap_or_else(|error| explain_removed_spawn_flags(error).exit());
+    // Double-clicked from Explorer: open the desktop app instead of a console session.
+    #[cfg(windows)]
     if cli.command.is_none() && owns_its_console() {
-        cli.command = Cli::parse_from(["orx", "up"]).command;
+        relaunch_as_app(cli.no_telemetry);
+        return;
     }
     let Some(command) = cli.command else {
         // Bare `orx`: print the command overview to stdout and exit 0.
@@ -984,12 +1020,9 @@ async fn main() {
     // plan mode): it must stay fast and touch neither stdout nor the network, so
     // skip the update check and telemetry and run it directly.
     if matches!(command, Command::InvocationGate) {
+        // Fail open: a missing model only loses attribution, a deny blocks every Bash call.
         if let Err(error) = commands::invocation_gate::run().await {
             eprintln!("orx invocation-gate: {error}");
-            println!(
-                "{}",
-                serde_json::json!({"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"OpenResearch could not capture this tool invocation's model"}})
-            );
         }
         return;
     }
@@ -1045,7 +1078,8 @@ async fn main() {
         command,
         Command::Version(_) | Command::Update(_) | Command::Delete(_) | Command::Feedback(_)
     ))
-    .then(updates::UpdateWarning::start);
+    // `orx up` updates from its own periodic pass, once it holds the backend lock that defers it.
+    .then(|| updates::UpdateWarning::start(!matches!(command, Command::Up(_))));
 
     // Anonymous usage analytics. Record the flag process-globally so command
     // modules can fire events without threading it through, then fire the
@@ -1086,9 +1120,35 @@ fn owns_its_console() -> bool {
     count == 1
 }
 
-#[cfg(not(windows))]
-fn owns_its_console() -> bool {
-    false
+/// Restarts as `orx app` in a console no one sees, as OpenResearch.exe does, so
+/// the console Explorer opened closes when this process exits.
+#[cfg(windows)]
+fn relaunch_as_app(no_telemetry: bool) {
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
+
+    let started = std::env::current_exe().and_then(|exe| {
+        let mut app = std::process::Command::new(exe);
+        if no_telemetry {
+            app.env(commands::app::APP_NO_TELEMETRY_ENV, "1");
+        }
+        app.arg(commands::app::APP_ARG)
+            // Inherited handles would tie the app to Explorer's console.
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+    });
+    match started {
+        // Explorer let this process take the foreground; pass that to the app's window.
+        // SAFETY: a plain syscall on the child's process id.
+        Ok(child) => unsafe {
+            AllowSetForegroundWindow(child.id());
+        },
+        Err(error) => show_error_dialog(&format!("Could not start OpenResearch: {error}")),
+    }
 }
 
 /// A double-clicked exe's console closes with it, so repeat the error in a dialog.
@@ -1301,16 +1361,6 @@ fn command_uses_lifecycle_lock(command: &Command) -> bool {
 mod cli_tests {
     use super::*;
 
-    /// A double-clicked orx.exe reaches `up` through this parse; an argv clap
-    /// rejected would panic there instead of opening the dashboard.
-    #[test]
-    fn a_double_click_parses_as_a_local_up() {
-        assert!(matches!(
-            Cli::parse_from(["orx", "up"]).command,
-            Some(Command::Up(args)) if args.remote.is_none()
-        ));
-    }
-
     #[test]
     fn library_add_commands_are_distinct_from_reading_skill_docs() {
         for name in ["skills", "templates"] {
@@ -1395,6 +1445,21 @@ mod cli_tests {
             };
             assert_eq!(actual, expected);
         }
+    }
+
+    #[test]
+    fn agent_spawn_rejects_removed_settings_flags() {
+        for program in ["orx", "orx.exe"] {
+            for flag in ["--harness", "--model", "--model=legacy", "--no-wake"] {
+                let error = Cli::try_parse_from([program, "agent", "spawn", "task", flag])
+                    .expect_err("removed flag");
+                assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+                assert!(explain_removed_spawn_flags(error)
+                    .to_string()
+                    .contains("saved New Chat settings"));
+            }
+        }
+        assert!(Cli::try_parse_from(["orx", "agent", "spawn", "task", "--project", "p1"]).is_ok());
     }
 
     #[test]

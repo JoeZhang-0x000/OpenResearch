@@ -89,7 +89,6 @@ import {
   captureUiEvent,
   isDemoProjectId,
   type FirstAction,
-  openProject,
   updateUiState,
   type AgentSelection,
   type Autonomy,
@@ -116,6 +115,7 @@ import { FileViewer, type FileScrollPosition } from "./components/FileViewer";
 import { confirmFileDiscard, FileBufferSession } from "./fileSync";
 import { RailHeader } from "./components/Header";
 import { UpdateBanner, useUpdateStatus } from "./components/UpdateBanner";
+import { DesktopAppBanner } from "./components/DesktopAppBanner";
 import { OfflineBanner } from "./components/OfflineBanner";
 import { NewProjectDialog } from "./components/ProjectsHome";
 import { ExperimentsTable } from "./components/ExperimentsTable";
@@ -263,6 +263,11 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
   const destination = parseDestination(location.pathname);
   const mainView = destination?.kind === "skills" ? "skills" : destination?.kind === "settings" ? destination.section ?? "settings" : "chat";
   const rememberedSessionRef = useRef<string | null>(null);
+  const rememberedProjectRef = useRef(projectId);
+  if (rememberedProjectRef.current !== projectId) {
+    rememberedProjectRef.current = projectId;
+    rememberedSessionRef.current = null;
+  }
   const activeSessionId = destination?.kind === "task" ? destination.sessionId ?? null : rememberedSessionRef.current;
   if (destination?.kind === "task") rememberedSessionRef.current = activeSessionId;
   const panelOpen = pane !== undefined;
@@ -333,7 +338,6 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
   const tourCompletedRef = useRef<boolean | undefined>(undefined);
   tourCompletedRef.current = uiState?.tourCompleted;
   const failedStartupItems = [
-    !sessionsQuery.data && sessionsQuery.error ? m.chat_all_sessions() : null,
     !projectsQuery.data && projectsQuery.error ? m.app_projects() : null,
     !uiStateQuery.data && uiStateQuery.error ? m.app_settings() : null,
   ].filter((item) => item !== null);
@@ -358,6 +362,8 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
   const observedRunsProjectRef = useRef<string | null>(null);
   const runsBaselineReadyRef = useRef(false);
   const baselineRunsRef = useRef(new Map<string, Run>());
+  const streamingRunsRef = useRef(new Set<string>());
+  const autoOpenRunsRef = useRef(new Map<string, Run>());
   const pendingFirstRunningRunsRef = useRef(new Map<string, Run>());
   const runsVisitRef = useRef(0);
   const experimentsRef = useRef(experiments);
@@ -720,7 +726,6 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
   }, [location.href, uiState, workspaceReady, railOpen, panelWidth, view]);
   const onboarded = uiState?.onboardingCompleted ?? false;
   const [demoWelcomeOpen, setDemoWelcomeOpen] = useState(false);
-  const [demoRunningRunId, setDemoRunningRunId] = useState<string | null>(null);
   const [composerFocusNonce, setComposerFocusNonce] = useState(0);
   const openDemoWelcome = useCallback(() => setDemoWelcomeOpen(true), []);
   const closeDemoWelcome = useCallback(async (choice: "explore_demo" | "create_project" | "dismiss") => {
@@ -848,6 +853,30 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
     return () => window.removeEventListener("resize", onResize);
   }, []);
 
+  // Open an experiment view as a right-panel tab (creating it if needed) and
+  // focus it.
+  const openExperimentTab = useCallback((
+    id: string,
+    view: ExperimentView = "overview",
+    intent: TabOpenIntent = "preview",
+    runId?: string,
+  ) => {
+    reportFirstAction("open_experiment");
+    const tab = { id, view };
+    setExpTabs((prev) => (prev.some((t) => sameExpTab(t, tab)) ? prev : [...prev, tab]));
+    if (view === "terminal" && isDemoProjectId(projectIdRef.current)) {
+      setPanelWidth((width) => Math.max(width, sideChatPanelWidth()));
+    }
+    openRightTab(tab, intent, runId);
+  }, [openRightTab]);
+
+  const openStreamingRun = useCallback((run: Run) => {
+    const navigation = navigationRef.current;
+    if (!navigation.isTask || (navigation.pane &&
+      !(navigation.pane.kind === "home" && navigation.pane.view === "experiments"))) return;
+    openExperimentTab(run.experimentId, "terminal", "preview", run.id);
+  }, [openExperimentTab]);
+
   const loadRunsBaseline = useCallback((baselineProjectId: string) => {
     runsBaselineReadyRef.current = false;
     baselineRunsRef.current.clear();
@@ -861,7 +890,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
           runsVisitRef.current !== runsVisit
         ) return;
         baselineRunsRef.current = new Map(loadedRuns.map((run) => [run.id, run]));
-        const shouldAutoOpen = [...pendingFirstRunningRunsRef.current.values()].some(
+        const autoOpenRuns = [...pendingFirstRunningRunsRef.current.values()].filter(
           (liveRun) => {
             const baselineRun = baselineRunsRef.current.get(liveRun.id);
             return (
@@ -879,14 +908,10 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
         }
         runsBaselineReadyRef.current = true;
         setRunDataReady(true);
-        if (isDemoProjectId(baselineProjectId)) {
-          setDemoRunningRunId((current) =>
-            loadedRuns.some((run) => run.id === current && run.status === "running")
-              ? current
-              : loadedRuns.find((run) => run.status === "running")?.id ?? null,
-          );
+        for (const run of autoOpenRuns) {
+          if (streamingRunsRef.current.has(run.id)) openStreamingRun(run);
+          else autoOpenRunsRef.current.set(run.id, run);
         }
-        if (shouldAutoOpen) openExperimentsTab(true);
       })
       .catch(() => {
         if (runsVisitRef.current === runsVisit) {
@@ -894,7 +919,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
           setRunDataReady(true);
         }
       });
-  }, [openExperimentsTab]);
+  }, [openStreamingRun]);
 
   // Per-project data. Harness agents spawn lazily on the first chat message.
   useEffect(() => {
@@ -902,7 +927,8 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
     observedRunsProjectRef.current = projectId;
     observedRunsRef.current.clear();
     liveRunIdsRef.current.clear();
-    openProject(projectId).catch(() => {});
+    streamingRunsRef.current.clear();
+    autoOpenRunsRef.current.clear();
     loadRunsBaseline(projectId);
     return () => { runsVisitRef.current++; };
   }, [loadRunsBaseline, projectId]);
@@ -925,12 +951,22 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
 
   // Live store updates.
   useOrxEvents({
+    onRunLog: (event) => {
+      if (!event.dataBase64 || streamingRunsRef.current.has(event.runId)) return;
+      streamingRunsRef.current.add(event.runId);
+      const run = autoOpenRunsRef.current.get(event.runId);
+      if (!run) return;
+      autoOpenRunsRef.current.delete(event.runId);
+      openStreamingRun(run);
+    },
     onReconnect: () => {
       const id = projectIdRef.current;
       if (!id) return;
       observedRunsProjectRef.current = id;
       observedRunsRef.current.clear();
       liveRunIdsRef.current.clear();
+      streamingRunsRef.current.clear();
+      autoOpenRunsRef.current.clear();
       loadRunsBaseline(id);
     },
     onRun: (run) => {
@@ -943,40 +979,22 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
       if (previous && previous.updatedAt > run.updatedAt) return;
       observedRunsRef.current.set(run.id, run);
       liveRunIdsRef.current.add(run.id);
-      if (isDemoProjectId(run.projectId)) {
-        setDemoRunningRunId((current) => {
-          if (run.status === "running") return current ?? run.id;
-          return current === run.id ? null : current;
-        });
-      }
       if (run.status !== "running" || previous?.status === "running") return;
       const baselineRun = baselineRunsRef.current.get(run.id);
       const newSinceBaseline =
         runsBaselineReadyRef.current &&
         (!baselineRun ||
           (baselineRun.status !== "running" && baselineRun.updatedAt <= run.updatedAt));
-      if ((previouslyLive && previous) || newSinceBaseline) openExperimentsTab(true);
-      else if (!runsBaselineReadyRef.current) pendingFirstRunningRunsRef.current.set(run.id, run);
+      if ((previouslyLive && previous) || newSinceBaseline) {
+        if (streamingRunsRef.current.has(run.id)) openStreamingRun(run);
+        else autoOpenRunsRef.current.set(run.id, run);
+      } else if (!runsBaselineReadyRef.current) pendingFirstRunningRunsRef.current.set(run.id, run);
     },
   });
 
   // Stable identity: in TreeView's layout-memo deps, so an inline arrow would
   // recompute the graph on every render.
   const showProjectScope = useCallback(() => setScope("project"), []);
-
-  // Open an experiment view as a right-panel tab (creating it if needed) and
-  // focus it.
-  const openExperimentTab = useCallback((
-    id: string,
-    view: ExperimentView = "overview",
-    intent: TabOpenIntent = "preview",
-    runId?: string,
-  ) => {
-    reportFirstAction("open_experiment");
-    const tab = { id, view };
-    setExpTabs((prev) => (prev.some((t) => sameExpTab(t, tab)) ? prev : [...prev, tab]));
-    openRightTab(tab, intent, runId);
-  }, [openRightTab]);
 
   // A `<run>` evidence chip in chat opens that run's logs — the only evidence
   // channel for a metric. Run ids are globally unique, so resolve the run to its
@@ -1684,11 +1702,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
     return <div className={EMPTY_STATE_CLASS_NAME}>{m.model_picker_unavailable()}<Button onClick={() => setProjectId(null)}>{m.app_projects()}</Button></div>;
   }
 
-  if (workspaceError && !workspaceReady) {
-    return <div className={EMPTY_STATE_CLASS_NAME}><p role="alert">{workspaceError}</p><Button onClick={retryWorkspace}>{m.app_retry()}</Button></div>;
-  }
-
-  if (projects === null || uiState === null || !workspaceLoaded || sessions === null) {
+  if (projects === null || uiState === null) {
     return (
       <div className="app flex flex-col h-full">
         <div className={EMPTY_STATE_CLASS_NAME}>
@@ -1699,16 +1713,18 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
     );
   }
 
-  if (!activeProject || (destination?.kind === "task" && activeSessionId && !sessions?.includes(activeSessionId))) {
+  if (!activeProject) {
     return <div className={EMPTY_STATE_CLASS_NAME}>{m.model_picker_unavailable()}<Button onClick={() => setProjectId(null)}>{m.app_projects()}</Button></div>;
   }
 
+  const conversationError = (!workspaceLoaded && workspaceError)
+    || (!sessionsQuery.data && sessionsQuery.error ? errorText(sessionsQuery.error) : null)
+    || (destination.kind === "task" && activeSessionId && sessions && !sessions.includes(activeSessionId) ? m.model_picker_unavailable() : null);
+  const conversationLoading = !conversationError && (!workspaceLoaded || sessions === null);
+  const retryConversation = () => { retryWorkspace(); void sessionsQuery.refetch(); };
+
   const railHeader = (
     <RailHeader
-      projectName={projects.find((p) => p.id === projectId)?.name ?? ""}
-      onHome={() => void router.navigate({ to: "/projects" })}
-      onNewProject={() => setNewProjectOpen(true)}
-      onRepository={() => selectMainView("git")}
       onCollapse={() => setRailOpen(false)}
     />
   );
@@ -1717,15 +1733,20 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
     <div className="app flex flex-col h-full">
       {runtime.kind === "local" && <OfflineBanner />}
       {runtime.kind === "local" && <UpdateBanner status={updateStatus} />}
-      {workspaceError && <div role="alert" className="flex items-center gap-2 px-4 py-2 text-subtext"><span>{workspaceError}</span><Button onClick={retryWorkspace}>{m.app_retry()}</Button></div>}
+      <DesktopAppBanner />
+      {workspaceError && <div role="alert" className="flex items-center gap-2 px-4 mac-titlebar:ps-20 win-titlebar:pe-36 py-2 text-subtext"><span>{workspaceError}</span><Button onClick={retryWorkspace}>{m.app_retry()}</Button></div>}
       <div className={`app-body workspace-body relative flex flex-1 min-h-0 py-0 px-3.5 ${workspaceCardVisible ? "workspace-card-visible" : ""}`}>
         {projectId && (
           <ChatPanel
             projectId={projectId}
-            projectName={activeProject?.name ?? ""}
+            projectName={activeProject.name}
+            contentLoading={conversationLoading}
+            contentError={conversationError || null}
+            onRetryContent={retryConversation}
             railHeader={railHeader}
             railOpen={railOpen}
             onShowRail={() => setRailOpen(true)}
+            onNewProject={() => setNewProjectOpen(true)}
             mainView={mainView}
             onSelectMainView={selectMainView}
             onOpenFile={openChatFile}
@@ -1737,7 +1758,6 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
             onOpenSubagent={openSubagentTab}
             onOpenSideChat={(parentSessionId, question) => void startSideChat(parentSessionId, question)}
             composerFocusNonce={composerFocusNonce}
-            demoRunningRunId={demoRunningRunId}
             runtime={runtime}
             onOpenDemoWelcome={
               activeProject && isDemoProjectId(activeProject.id) ? openDemoWelcome : undefined
@@ -1764,7 +1784,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
             ) : null}
           </ChatPanel>
         )}
-        {mainView === "chat" && (
+        {mainView === "chat" && workspaceReady && !conversationError && (
           <WorkspaceTools
             expanded={workspaceCardVisible}
             experiments={experiments}
@@ -1786,7 +1806,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
         )}
         {mainView === "chat" && panelOpen && (
           <aside
-            className={`right-pane relative shrink-0 min-w-0 flex flex-col mt-5 me-0 mb-5 ms-3.5 bg-canvas [&.max]:fixed [&.max]:inset-2.5 [&.max]:m-0 [&.max]:z-60 [&.max]:shadow-panel-max border border-border rounded-lg overflow-hidden shadow-elevated ${panelMax ? "max" : ""}`}
+            className={`right-pane relative shrink-0 min-w-0 flex flex-col mt-5 win-titlebar:mt-10 me-0 mb-5 ms-3.5 bg-background [&.max]:fixed [&.max]:inset-2.5 mac-titlebar:[&.max]:top-8 win-titlebar:[&.max]:top-10 [&.max]:m-0 [&.max]:z-60 [&.max]:shadow-panel-max border border-border rounded-lg overflow-hidden shadow-elevated ${panelMax ? "max" : ""}`}
             style={panelMax ? undefined : { width: panelWidth }}
             data-onboarding="experiments"
           >

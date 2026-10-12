@@ -80,18 +80,14 @@ impl Store {
         if !session.harness.starts_with("acp:") {
             return Ok(None);
         }
-        if let Some(parent) = session
-            .side_parent_session_id
-            .as_deref()
-            .or(session.parent_session_id.as_deref())
-        {
+        if let Some(parent) = session.side_parent_session_id.as_deref() {
             if let Some(state) = self.acp_session_state(parent)? {
                 if state.launch.id == session.harness {
                     return Ok(Some(state));
                 }
             }
         }
-        let launch = crate::local::acp::definitions()
+        let launch = crate::local::acp::registered_definitions()
             .into_iter()
             .find(|definition| definition.id == session.harness)
             .ok_or_else(|| anyhow!("ACP harness is no longer configured"))?;

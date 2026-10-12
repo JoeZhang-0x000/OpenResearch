@@ -529,7 +529,7 @@ pub fn registry() -> Vec<Box<dyn Harness>> {
         Box::new(antigravity::Antigravity),
     ];
     harnesses.extend(
-        crate::local::acp::definitions()
+        crate::local::acp::registered_definitions()
             .into_iter()
             .map(|definition| Box::new(acp::Acp(definition)) as Box<dyn Harness>),
     );

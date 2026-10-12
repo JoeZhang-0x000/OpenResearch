@@ -60,6 +60,9 @@ async fn catalog(args: CatalogArgs, json: bool) -> Result<()> {
     }
     if filtered.is_empty() {
         println!("No matching compute offers.");
+        if gpu.is_some() {
+            println!("GPU ids look like RTX_3090 or H100_SXM; run `orx compute` to list them.");
+        }
         return Ok(());
     }
 
@@ -187,7 +190,7 @@ pub enum ComputeCommand {
     /// Test execution readiness. Failure exits nonzero.
     Test(CheckArgs),
     /// Authenticate interactively, then test readiness.
-    Connect(CheckArgs),
+    Connect(ConnectArgs),
     /// Read or safely replace ~/.ssh/config.
     SshConfig {
         #[command(subcommand)]
@@ -240,19 +243,34 @@ pub struct ConfigureArgs {
     account: Option<String>,
     #[arg(long)]
     time_limit: Option<String>,
+    /// Default `#SBATCH --cpus-per-task` for Slurm runs.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    cpus_per_task: Option<u32>,
+    /// Default `#SBATCH --mem` for Slurm runs (64G, 4000M, or megabytes).
+    #[arg(long)]
+    mem: Option<String>,
     #[arg(long)]
     context: Option<String>,
     #[arg(long)]
     namespace: Option<String>,
     #[arg(long)]
     address: Option<String>,
-    /// Clear a saved field; repeat for multiple fields (e.g. --clear time-limit).
+    /// Clear a saved field; repeat for multiple fields (e.g. --clear time-limit, --clear mem).
     #[arg(long)]
     clear: Vec<String>,
     /// JSON credentials: {"token":...}, {"key":...}, or {"tokenId":...,"tokenSecret":...}. Use - for stdin.
     #[arg(long)]
     credentials_file: Option<String>,
 }
+#[derive(Debug, Args)]
+pub struct ConnectArgs {
+    #[command(flatten)]
+    check: CheckArgs,
+    /// Idle lifetime for a new SSH master, in seconds (default: 86400; 0 means indefinite).
+    #[arg(long)]
+    persist: Option<u64>,
+}
+
 #[derive(Debug, Args)]
 pub struct CheckArgs {
     backend: Backend,
@@ -304,7 +322,14 @@ impl ConfigureArgs {
         let backend = self.backend.name();
         let allowed: &[&str] = match backend {
             "ssh" => &["host", "container", "defaultHost"],
-            "slurm" => &["host", "partition", "account", "timeLimit"],
+            "slurm" => &[
+                "host",
+                "partition",
+                "account",
+                "timeLimit",
+                "cpusPerTask",
+                "mem",
+            ],
             "k8s" => &["context", "namespace"],
             "ray" => &["address"],
             "hf" => &["token"],
@@ -320,6 +345,7 @@ impl ConfigureArgs {
             ("partition", self.partition),
             ("account", self.account),
             ("timeLimit", self.time_limit),
+            ("mem", self.mem),
             ("context", self.context),
             ("namespace", self.namespace),
             ("address", self.address),
@@ -327,6 +353,9 @@ impl ConfigureArgs {
             if let Some(value) = value {
                 body.insert(key.into(), json!(value));
             }
+        }
+        if let Some(cpus) = self.cpus_per_task {
+            body.insert("cpusPerTask".into(), json!(cpus));
         }
         if let Some(path) = self.credentials_file {
             let credentials: Map<String, Value> = serde_json::from_str(&read_input(&path)?)
@@ -358,6 +387,7 @@ impl ConfigureArgs {
         for field in self.clear {
             let key = match field.as_str() {
                 "time-limit" => "timeLimit",
+                "cpus-per-task" => "cpusPerTask",
                 "default-host" => "defaultHost",
                 other => other,
             };
@@ -374,6 +404,8 @@ impl ConfigureArgs {
                 key.into(),
                 if matches!(key, "container" | "defaultHost") {
                     Value::Null
+                } else if key == "cpusPerTask" {
+                    json!(0)
                 } else {
                     json!("")
                 },
@@ -400,16 +432,22 @@ impl ConfigureArgs {
 }
 
 async fn run_command(command: ComputeCommand, json_output: bool) -> Result<()> {
-    if let ComputeCommand::Test(ref args) | ComputeCommand::Connect(ref args) = command {
+    if let ComputeCommand::Test(ref args) = command {
         validate_check(args)?;
     }
     if let ComputeCommand::Connect(ref args) = command {
+        validate_check(&args.check)?;
+        if args.persist.is_some()
+            && (!cfg!(unix) || !matches!(args.check.backend, Backend::Ssh | Backend::Slurm))
+        {
+            return Err(anyhow!("--persist requires SSH or Slurm on Unix."));
+        }
         if json_output {
             return Err(anyhow!(
                 "connect is interactive; use test --json for machine-readable checks."
             ));
         }
-        connect(args).await?;
+        connect(&args.check, args.persist).await?;
     }
     let is_check = matches!(
         command,
@@ -429,7 +467,7 @@ async fn run_command(command: ComputeCommand, json_output: bool) -> Result<()> {
             let backend = args.backend.name();
             settings::configure(backend, (*args).body()?).await?
         }
-        ComputeCommand::Test(args) | ComputeCommand::Connect(args) => {
+        ComputeCommand::Test(args) | ComputeCommand::Connect(ConnectArgs { check: args, .. }) => {
             settings::check(
                 args.backend.name(),
                 args.host,
@@ -551,7 +589,7 @@ fn instructions_write(path: &std::path::Path, content: &str, expected: &str) -> 
     instructions_read(path)
 }
 
-async fn connect(args: &CheckArgs) -> Result<()> {
+async fn connect(args: &CheckArgs, persist: Option<u64>) -> Result<()> {
     use std::io::IsTerminal;
     if !std::io::stdin().is_terminal() {
         return Err(anyhow!("connect requires a terminal for login/MFA. Use configure with --credentials-file - for unattended credential setup."));
@@ -571,8 +609,11 @@ async fn connect(args: &CheckArgs) -> Result<()> {
             }
             .ok_or_else(|| anyhow!("Pass --host or configure a default host."))?;
             let target = crate::jobs::ssh::SshTarget::alias(&host);
-            let argv = crate::jobs::ssh::interactive_args(&target)?;
-            interactive_command("ssh", &argv).await?;
+            let connection = crate::jobs::ssh::interactive_args(&target, persist).await?;
+            interactive_command("ssh", &connection.args).await?;
+            if let Some(warning) = crate::jobs::ssh::setup_connection_sharing(&target).await {
+                eprintln!("orx: warning: {warning}");
+            }
         }
         Backend::Hf => {
             interactive_command("hf", &["auth".into(), "login".into()]).await?;
@@ -606,10 +647,12 @@ async fn interactive_command(program: &str, args: &[String]) -> Result<()> {
     let path = crate::local::shell_env::find_on_path(program).ok_or_else(|| {
         anyhow!("{program} is not installed. Install it, then retry compute connect.")
     })?;
-    let status = tokio::process::Command::new(path)
-        .args(args)
-        .status()
-        .await?;
+    let mut command = tokio::process::Command::new(path);
+    command.args(args);
+    if program == "ssh" {
+        command.env("ORX_SSH_PROBE", "1");
+    }
+    let status = command.status().await?;
     if !status.success() {
         return Err(anyhow!("{program} exited with {status}."));
     }
@@ -701,6 +744,24 @@ mod tests {
             body(&["slurm", "--clear", "time-limit"]).unwrap(),
             json!({"timeLimit":""})
         );
+        assert_eq!(
+            body(&["slurm", "--cpus-per-task", "8", "--mem", "64G"]).unwrap(),
+            json!({"cpusPerTask":8, "mem":"64G"})
+        );
+        assert_eq!(
+            body(&["slurm", "--clear", "cpus-per-task", "--clear", "mem"]).unwrap(),
+            json!({"cpusPerTask":0, "mem":""})
+        );
+        assert!(body(&["ssh", "--host", "lab", "--mem", "64G"]).is_err());
+        assert!(crate::Cli::try_parse_from([
+            "orx",
+            "compute",
+            "configure",
+            "slurm",
+            "--cpus-per-task",
+            "0"
+        ])
+        .is_err());
         assert_eq!(
             body(&["ssh", "--host", "lab", "--clear", "container"]).unwrap(),
             json!({"host":"lab", "container":null})

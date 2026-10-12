@@ -73,8 +73,127 @@ pub fn definitions() -> Vec<Definition> {
         .unwrap_or_default()
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Preset {
+    #[serde(flatten)]
+    pub launch: Definition,
+    pub setup_url: &'static str,
+    pub needs_connection_adapter: bool,
+}
+
+pub fn presets() -> Vec<Preset> {
+    [
+        (
+            "dee4a440-fd64-4217-a4a7-1d4c148c0dd1",
+            "DeepSeek Harness",
+            "dsh",
+            &["--profile", "acp"][..],
+            "https://github.com/deepseek-ai/deepseek-harness",
+        ),
+        (
+            "a8b48911-e95c-42cb-bc35-bab3aa83e5e2",
+            "Kimi Code",
+            "kimi",
+            &["acp"][..],
+            "https://www.kimi.com/code/docs/en/kimi-code-cli/",
+        ),
+        (
+            "1dba9897-707b-4cd8-b595-c8c26115f563",
+            "MiniMax Code",
+            "mcode",
+            &["acp"][..],
+            "https://github.com/MiniMax-AI/minimax-code",
+        ),
+        (
+            "2f1639e0-3f0f-4594-bb5b-a4078c36d5a4",
+            "ZCode",
+            "zcode-acp-server",
+            &[][..],
+            "https://github.com/william0wang/zcode-acp#install",
+        ),
+        (
+            "467b1900-c3c3-47c1-8b87-09389e1c44b5",
+            "Pi",
+            "pi-acp",
+            &[][..],
+            "https://github.com/svkozak/pi-acp#install",
+        ),
+        (
+            "565e351e-62c7-488f-a58a-914d30cc5776",
+            "Devin CLI",
+            "devin",
+            &["acp"][..],
+            "https://docs.devin.ai/cli",
+        ),
+        (
+            "ac7f713b-b520-40d2-9b56-75deca1574c7",
+            "Grok Build",
+            "grok",
+            &["agent", "stdio"][..],
+            "https://github.com/xai-org/grok-build",
+        ),
+    ]
+    .into_iter()
+    .map(|(id, name, executable, arguments, setup_url)| Preset {
+        needs_connection_adapter: matches!(executable, "pi-acp" | "zcode-acp-server"),
+        launch: Definition {
+            id: format!("acp:{id}"),
+            name: name.into(),
+            executable: executable.into(),
+            arguments: arguments
+                .iter()
+                .map(|argument| (*argument).into())
+                .collect(),
+        },
+        setup_url,
+    })
+    .collect()
+}
+
+pub fn registered_definitions() -> Vec<Definition> {
+    let mut definitions = definitions();
+    for preset in presets() {
+        let mut launch = preset.launch;
+        if let Some(path) = executable_path(&launch.executable) {
+            launch.executable = path.to_string_lossy().into_owned();
+        }
+        if !definitions.iter().any(|saved| {
+            executable_path(&saved.executable)
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_else(|| saved.executable.clone())
+                == launch.executable
+                && saved.arguments == launch.arguments
+        }) {
+            definitions.push(launch);
+        }
+    }
+    definitions
+}
+
+pub fn executable_path(executable: &str) -> Option<std::path::PathBuf> {
+    let path = std::path::Path::new(executable);
+    if path.is_absolute() {
+        return path.is_file().then(|| path.to_path_buf());
+    }
+    crate::local::shell_env::find_on_path(executable).or_else(|| {
+        let home = dirs::home_dir()?;
+        [".local/bin", ".grok/bin", ".devin/bin"]
+            .iter()
+            .find_map(|directory| {
+                crate::local::shell_env::find_in_dir(&home.join(directory), executable)
+            })
+    })
+}
+
 pub fn save(definition: Definition, create: bool) -> Result<()> {
     definition.validate()?;
+    if presets()
+        .iter()
+        .any(|preset| preset.launch.id == definition.id)
+    {
+        bail!("Built-in coding agents cannot be edited; add a custom configuration instead");
+    }
     let mut found = false;
     crate::telemetry::mutate_settings(|settings| {
         if let Some(saved) = settings
@@ -112,7 +231,9 @@ pub async fn test_connection(definition: &Definition) -> Result<serde_json::Valu
     use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
     definition.validate()?;
-    let mut command = tokio::process::Command::new(&definition.executable);
+    let executable = executable_path(&definition.executable)
+        .unwrap_or_else(|| std::path::PathBuf::from(&definition.executable));
+    let mut command = tokio::process::Command::new(executable);
     command
         .args(&definition.arguments)
         .stdin(std::process::Stdio::piped())
@@ -170,6 +291,47 @@ pub async fn test_connection(definition: &Definition) -> Result<serde_json::Valu
 mod tests {
     use super::*;
 
+    #[test]
+    fn popular_agents_have_valid_stable_launchers() {
+        let presets = presets();
+        let mut ids = std::collections::HashSet::new();
+        for preset in &presets {
+            preset.launch.validate().unwrap();
+            assert!(ids.insert(preset.launch.id.clone()));
+            assert!(preset.setup_url.starts_with("https://"));
+        }
+        let commands: Vec<_> = presets
+            .iter()
+            .map(|preset| {
+                (
+                    preset.launch.name.as_str(),
+                    preset.launch.executable.as_str(),
+                    preset
+                        .launch
+                        .arguments
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            commands,
+            [
+                ("DeepSeek Harness", "dsh", vec!["--profile", "acp"]),
+                ("Kimi Code", "kimi", vec!["acp"]),
+                ("MiniMax Code", "mcode", vec!["acp"]),
+                ("ZCode", "zcode-acp-server", vec![]),
+                ("Pi", "pi-acp", vec![]),
+                ("Devin CLI", "devin", vec!["acp"]),
+                ("Grok Build", "grok", vec!["agent", "stdio"]),
+            ]
+        );
+        let file = std::env::current_exe().unwrap();
+        assert_eq!(executable_path(file.to_str().unwrap()), Some(file));
+        assert!(executable_path("missing-popular-agent-28e8c11").is_none());
+    }
+
     #[tokio::test]
     async fn initialization_uses_stdio_and_never_creates_a_session() {
         let peer = r#"
@@ -204,6 +366,17 @@ for line in sys.stdin:
         let result = test_connection(&definition).await.unwrap();
         assert_eq!(result["status"], "connected");
         assert_eq!(result["agentInfo"]["version"], "1.0");
+        use crate::local::harness::Harness;
+        let mut detected = definition.clone();
+        detected.id = presets()[0].launch.id.clone();
+        let adapter = crate::local::harness::acp::Acp(detected);
+        let snapshot = adapter.detect_snapshot().await.unwrap();
+        assert!(snapshot.installed);
+        assert!(!snapshot.agent_ready);
+        let connected = adapter.detect().await.unwrap();
+        assert!(connected.agent_ready);
+        assert_eq!(connected.version.as_deref(), Some("1.0"));
+        assert_eq!(connected.setup_url, Some(presets()[0].setup_url));
         let mut missing = definition;
         missing.executable = format!("missing-acp-{}", uuid::Uuid::new_v4());
         assert!(test_connection(&missing)
