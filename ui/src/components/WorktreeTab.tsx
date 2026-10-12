@@ -1,4 +1,4 @@
-import { FolderOpen } from "lucide-react";
+import { FolderOpen, FolderSync } from "lucide-react";
 import { WorkspaceEmptyState } from "./WorkspaceEmptyState";
 import { isImmutableQuery } from "../queries/invalidation";
 import { useQuery } from "@tanstack/react-query";
@@ -29,8 +29,11 @@ import { ltr } from "../i18n";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  fmtNumber,
   githubBranchUrl,
   manageProjectFile,
+  revealFileInManager,
+  syncSessionWorktree,
   type Project,
 } from "../api";
 
@@ -45,7 +48,7 @@ import {
   fileContextMenuTarget,
   type FileContextMenuTarget,
 } from "./FileTreeActions";
-import { showAlert } from "./ui";
+import { IconButton, showAlert, Spinner } from "./ui";
 
 export type WorktreeView = CodeBrowserView;
 
@@ -58,9 +61,13 @@ export function WorktreeTab({
   onToggledChange,
   onOpenFile,
   canRenameFile,
+  remote,
 }: {
   sessionId?: string;
   project: Project;
+  /** True when `orx up` serves this dashboard over SSH — OS file actions
+   * (reveal in file manager) act on the remote box, so they're local-only. */
+  remote?: boolean;
   /** Which segmented view is showing (lives on the tab def, so it survives the
    * unmount/remount when another end-pane tab fronts this one). */
   view: WorktreeView;
@@ -139,6 +146,38 @@ export function WorktreeTab({
     const root = tree?.path ?? project.repoPath;
     copyFilePath(root, path);
   };
+  const [syncing, setSyncing] = useState(false);
+  /** Overlay this worktree's changes into the project folder — the explicit
+   * "land my work in the folder I picked" action. */
+  const sync = async () => {
+    if (!sessionId) return;
+    setSyncing(true);
+    try {
+      const result = await syncSessionWorktree(sessionId);
+      const changes = result.copied + result.deleted;
+      showAlert(
+        changes === 0
+          ? m.worktree_sync_none()
+          : changes === 1
+            ? m.worktree_sync_one()
+            : m.worktree_sync_many({ count: fmtNumber(changes) }),
+        changes === 0 ? "info" : "success",
+      );
+      load();
+    } catch (error) {
+      showAlert(error instanceof Error ? error.message : String(error), "error");
+    } finally {
+      setSyncing(false);
+    }
+  };
+  const revealWorktree = async () => {
+    if (!sessionId) return;
+    try {
+      await revealFileInManager(projectId, ".", { sessionId });
+    } catch (error) {
+      showAlert(error instanceof Error ? error.message : String(error), "error");
+    }
+  };
 
   return (
     <div className="code-tab flex flex-col h-full min-h-0 wt-tab">
@@ -154,6 +193,28 @@ export function WorktreeTab({
             : undefined
         }
         githubTitle={githubBranch ? m.a11y_open_branch_github({ branch: ltr(githubBranch) }) : undefined}
+        actions={liveWorktree && sessionId ? (
+          <>
+            <IconButton
+              size="small"
+              data-tip={remote ? m.file_viewer_os_action_local_only() : m.file_viewer_reveal_in_file_manager()}
+              aria-label={m.file_viewer_reveal_in_file_manager()}
+              disabled={remote}
+              onClick={() => void revealWorktree()}
+            >
+              <FolderOpen size={13} />
+            </IconButton>
+            <IconButton
+              size="small"
+              data-tip={m.worktree_sync_to_folder()}
+              aria-label={m.worktree_sync_to_folder()}
+              disabled={syncing}
+              onClick={() => void sync()}
+            >
+              {syncing ? <Spinner /> : <FolderSync size={13} />}
+            </IconButton>
+          </>
+        ) : undefined}
         refreshing={loading}
         onRefresh={load}
       />

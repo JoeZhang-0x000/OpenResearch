@@ -2260,6 +2260,141 @@ pub fn changed_files(repo: &Path, base: &str) -> Result<Vec<ChangedFile>> {
     Ok(files)
 }
 
+/// Outcome of [`sync_worktree_changes`]: files written or removed in the hub
+/// checkout, plus the paths that blocked the sync because the hub changed them
+/// since the same base.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SyncOutcome {
+    pub copied: usize,
+    pub deleted: usize,
+    pub conflicts: Vec<String>,
+}
+
+/// Overlay a checkout's changes since `base` onto another checkout of the same
+/// repository — the "copy work back to the project folder" step behind the
+/// dashboard's sync button. A file overlay, not a merge: the target keeps its
+/// branch and the files arrive uncommitted, so the user reviews them like
+/// their own edits.
+///
+/// Any path the target itself changed since `base` is a conflict — copying
+/// over it would silently discard one side's work — so when the change sets
+/// overlap nothing is written and the paths come back in `conflicts`.
+pub fn sync_worktree_changes(source: &Path, base: &str, target: &Path) -> Result<SyncOutcome> {
+    let changes = changed_files(source, base)?;
+    // One file-level action per affected path: copies land the source's current
+    // bytes, removals drop deletions and the vacated half of renames.
+    enum Act {
+        Copy(String),
+        Remove(String),
+    }
+    let mut acts = Vec::new();
+    for change in &changes {
+        match change.status {
+            ChangedStatus::Deleted => acts.push(Act::Remove(change.path.clone())),
+            _ => {
+                acts.push(Act::Copy(change.path.clone()));
+                if let Some(old) = &change.old_path {
+                    acts.push(Act::Remove(old.clone()));
+                }
+            }
+        }
+    }
+    let target_changed: std::collections::HashSet<String> = changed_files(target, base)?
+        .into_iter()
+        .flat_map(|c| [c.path].into_iter().chain(c.old_path))
+        .collect();
+    // A path blocks the sync only when the target changed it too AND its state
+    // there isn't already the source's desired result — otherwise repeat syncs
+    // would conflict on everything they copied last time.
+    let mut conflicts = Vec::new();
+    for act in &acts {
+        let rel = match act {
+            Act::Copy(rel) | Act::Remove(rel) => rel,
+        };
+        if !target_changed.contains(rel) {
+            continue;
+        }
+        let conflicting = match act {
+            Act::Copy(_) => {
+                !files_identical(&checkout_path(source, rel)?, &checkout_path(target, rel)?)
+            }
+            Act::Remove(_) => checkout_path(target, rel)?.exists(),
+        };
+        if conflicting {
+            conflicts.push(rel.clone());
+        }
+    }
+    if !conflicts.is_empty() {
+        conflicts.sort();
+        return Ok(SyncOutcome {
+            conflicts,
+            ..SyncOutcome::default()
+        });
+    }
+    let mut outcome = SyncOutcome::default();
+    for act in &acts {
+        match act {
+            Act::Copy(rel) => {
+                let from = checkout_path(source, rel)?;
+                if !from.is_file() {
+                    // A broken symlink or a file that vanished mid-sync.
+                    continue;
+                }
+                let to = checkout_path(target, rel)?;
+                if files_identical(&from, &to) {
+                    continue;
+                }
+                if let Some(parent) = to.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| anyhow!("Could not create {}: {}", parent.display(), e))?;
+                }
+                std::fs::copy(&from, &to).map_err(|e| {
+                    anyhow!(
+                        "Could not copy {} to {}: {}",
+                        from.display(),
+                        to.display(),
+                        e
+                    )
+                })?;
+                outcome.copied += 1;
+            }
+            Act::Remove(rel) => {
+                let stale = checkout_path(target, rel)?;
+                if stale.is_file() || stale.is_symlink() {
+                    std::fs::remove_file(&stale)
+                        .map_err(|e| anyhow!("Could not remove {}: {}", stale.display(), e))?;
+                    outcome.deleted += 1;
+                }
+            }
+        }
+    }
+    Ok(outcome)
+}
+
+/// Byte equality for two on-disk files — false when either is missing or not a
+/// regular file, so identical symlinks resolve through their targets.
+fn files_identical(a: &Path, b: &Path) -> bool {
+    match (std::fs::read(a), std::fs::read(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// `rel` under `root`, refusing absolute paths and any component that escapes
+/// or steps into `.git` — the same bar the dashboard file endpoints apply.
+fn checkout_path(root: &Path, rel: &str) -> Result<PathBuf> {
+    let rel_path = Path::new(rel);
+    let safe = !rel_path.is_absolute()
+        && rel_path.components().all(|c| {
+            matches!(c, std::path::Component::Normal(name) if !name.eq_ignore_ascii_case(".git"))
+        });
+    if safe {
+        Ok(root.join(rel_path))
+    } else {
+        Err(anyhow!("path must stay inside the repository: {rel}"))
+    }
+}
+
 /// The checked-out branch name, or `None` when detached (`rev-parse
 /// --abbrev-ref HEAD` prints the literal `HEAD` — e.g. a fresh worktree
 /// before the agent checks out its branch) or when rev-parse fails outright
@@ -2722,6 +2857,75 @@ mod tests {
             .expect("delete row");
         assert_eq!(deleted.status, ChangedStatus::Deleted);
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn sync_worktree_changes_overlays_files_and_flags_conflicts() {
+        let hub = temp_repo();
+        write(&hub, "old.txt", "rename me\n");
+        write(&hub, "gone.txt", "delete me\n");
+        run(&hub, &["add", "-A"]);
+        run(&hub, &["commit", "-q", "-m", "seed2"]);
+        let base = run(&hub, &["rev-parse", "HEAD"]);
+        let wt = hub.with_file_name(format!("{}-wt", hub.file_name().unwrap().to_string_lossy()));
+        run(
+            &hub,
+            &["worktree", "add", "-q", "--detach", &wt.to_string_lossy()],
+        );
+        // The worktree's mix: a committed new file, an uncommitted edit, an
+        // untracked file, a rename and a delete.
+        write(&wt, "committed.txt", "c\n");
+        run(&wt, &["add", "-A"]);
+        run(&wt, &["commit", "-q", "-m", "agent work"]);
+        write(&wt, "seed.txt", "seed edited\n");
+        write(&wt, "untracked.txt", "u\n");
+        run(&wt, &["mv", "old.txt", "new.txt"]);
+        run(&wt, &["rm", "-q", "gone.txt"]);
+
+        let outcome = sync_worktree_changes(&wt, &base, &hub).unwrap();
+        assert!(outcome.conflicts.is_empty());
+        assert_eq!(outcome.copied, 4);
+        assert_eq!(outcome.deleted, 2);
+        assert_eq!(
+            std::fs::read_to_string(hub.join("committed.txt")).unwrap(),
+            "c\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(hub.join("seed.txt")).unwrap(),
+            "seed edited\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(hub.join("untracked.txt")).unwrap(),
+            "u\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(hub.join("new.txt")).unwrap(),
+            "rename me\n"
+        );
+        assert!(!hub.join("gone.txt").exists() && !hub.join("old.txt").exists());
+
+        // A second sync with no new work copies nothing and conflicts on
+        // nothing — the hub already holds the synced state.
+        let again = sync_worktree_changes(&wt, &base, &hub).unwrap();
+        assert_eq!(again, SyncOutcome::default());
+
+        // A hub-side edit to a path the worktree also changed blocks the sync
+        // without touching the hub's copy.
+        write(&hub, "committed.txt", "hub edit\n");
+        write(&wt, "committed.txt", "wt edit\n");
+        let blocked = sync_worktree_changes(&wt, &base, &hub).unwrap();
+        assert_eq!(blocked.conflicts, vec!["committed.txt".to_string()]);
+        assert_eq!(blocked.copied + blocked.deleted, 0);
+        assert_eq!(
+            std::fs::read_to_string(hub.join("committed.txt")).unwrap(),
+            "hub edit\n"
+        );
+
+        run(
+            &hub,
+            &["worktree", "remove", "--force", &wt.to_string_lossy()],
+        );
+        let _ = std::fs::remove_dir_all(&hub);
     }
 
     #[test]

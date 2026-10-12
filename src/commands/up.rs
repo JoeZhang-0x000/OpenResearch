@@ -765,6 +765,10 @@ fn router(state: AppState, remote_auth: Option<RemoteAuth>) -> Router {
         )
         .route("/api/chat/sessions/{id}/messages", get(chat_messages))
         .route("/api/chat/sessions/{id}/worktree", get(session_worktree))
+        .route(
+            "/api/chat/sessions/{id}/worktree/sync",
+            post(sync_session_worktree),
+        )
         .route("/api/chat/sessions/{id}/message", post(send_chat_message))
         .route("/api/chat/sessions/{id}/shell", post(run_shell_command))
         .route(
@@ -2786,11 +2790,55 @@ async fn session_worktree(Path(id): Path<String>) -> ApiResult {
         let payload = local::git::working_tree_diff_against(&root, Some(&base))?;
         Ok(Json(json!({
             "exists": true,
+            "path": root,
             "branch": branch,
             "baselineBranch": baseline,
             "baseSha": base,
             "files": files,
             "diff": diff_json(payload),
+        })))
+    })
+    .await
+}
+
+/// Copy the session worktree's changes since the baseline fork into the
+/// project folder — the explicit sync that lands agent work where the user
+/// picked it. A file overlay, not a merge: the folder's branch is untouched
+/// and files arrive uncommitted for review. Paths the folder itself changed
+/// since the fork come back as conflicts instead of being overwritten.
+async fn sync_session_worktree(Path(id): Path<String>) -> ApiResult {
+    blocking_api(move || {
+        let store = Store::open()?;
+        let session = store
+            .get_chat_session(&id)?
+            .ok_or_else(|| not_found("chat session"))?;
+        let project = store
+            .get_local_project(&session.project_id)?
+            .ok_or_else(|| not_found("project"))?;
+        let dir = local::git::existing_session_worktree_path(&project, &session.id);
+        let worktree = crate::paths::canonicalize(&dir).map_err(|e| {
+            bad_request(format!(
+                "this session's worktree is no longer available: {e}"
+            ))
+        })?;
+        let hub = crate::paths::canonicalize(std::path::Path::new(&project.repo_path))
+            .map_err(|e| ApiError::from(anyhow!("repo clone unavailable: {e}")))?;
+        let base = local::git::merge_base(&worktree, &project.baseline_branch, "HEAD")?
+            .unwrap_or_else(|| "HEAD".to_string());
+        let outcome = local::git::sync_worktree_changes(&worktree, &base, &hub)?;
+        if !outcome.conflicts.is_empty() {
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                format!(
+                    "the project folder also changed {} — move it aside or commit it first",
+                    outcome.conflicts.join(", ")
+                ),
+            ));
+        }
+        Ok(Json(json!({
+            "ok": true,
+            "copied": outcome.copied,
+            "deleted": outcome.deleted,
         })))
     })
     .await
