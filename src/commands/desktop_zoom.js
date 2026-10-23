@@ -9,3 +9,8 @@ window.addEventListener("keydown", (event) => {
     event.stopImmediatePropagation();
     window.ipc.postMessage(`page-zoom:${action}`);
 }, true);
+
+// Restore titlebar spacing as soon as the new document is ready after a reload.
+document.addEventListener("DOMContentLoaded", () => {
+    window.ipc.postMessage("page-zoom:sync");
+}, { once: true });

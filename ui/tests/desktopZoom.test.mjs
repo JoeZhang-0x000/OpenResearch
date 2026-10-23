@@ -8,7 +8,7 @@ const script = readFileSync(new URL('../../src/commands/desktop_zoom.js', import
 function press(key, options = {}, mac = false) {
   const messages = [];
   let handler;
-  runInNewContext(script, { window: {
+  runInNewContext(script, { document: { addEventListener() {} }, window: {
     __ORX_MAC_TITLEBAR__: mac,
     addEventListener: (type, listener, capture) => {
       assert.equal(type, 'keydown');
@@ -41,4 +41,20 @@ test('unrelated input and macOS menu accelerators are left alone', () => {
   assert.deepEqual(press('0', { shiftKey: true }), ignored);
   assert.deepEqual(press('x'), ignored);
   assert.deepEqual(press('=', {}, true), ignored);
+});
+
+test('a reloaded document requests the current host zoom instead of replaying a startup value', () => {
+  const messages = [];
+  let ready;
+  runInNewContext(script, {
+    window: { addEventListener() {}, ipc: { postMessage: (message) => messages.push(message) } },
+    document: { addEventListener(type, handler, options) {
+      assert.equal(type, 'DOMContentLoaded');
+      assert.equal(options.once, true);
+      ready = handler;
+    } },
+  });
+  assert.deepEqual(messages, []);
+  ready();
+  assert.deepEqual(messages, ['page-zoom:sync']);
 });

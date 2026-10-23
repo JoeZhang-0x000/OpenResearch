@@ -653,21 +653,6 @@ mod imp {
         }
     }
 
-    #[cfg(test)]
-    mod zoom_tests {
-        use super::ZoomAction;
-
-        #[test]
-        fn zoom_steps_clamp_and_reset() {
-            assert_eq!(ZoomAction::In.next(100), 110);
-            assert_eq!(ZoomAction::In.next(200), 200);
-            assert_eq!(ZoomAction::Out.next(100), 90);
-            assert_eq!(ZoomAction::Out.next(50), 50);
-            assert_eq!(ZoomAction::Reset.next(50), 100);
-            assert_eq!(ZoomAction::Reset.next(200), 100);
-        }
-    }
-
     enum Quit {
         No,
         Flushing,
@@ -877,6 +862,9 @@ mod imp {
             move |request| {
                 let message = request.body().as_str();
                 match message {
+                    "page-zoom:sync" => {
+                        let _ = proxy.send_event(UserEvent::SyncZoom);
+                    }
                     "page-zoom:in" => {
                         let _ = proxy.send_event(UserEvent::Zoom(ZoomAction::In));
                     }
@@ -1352,11 +1340,25 @@ mod imp {
         handler.call((Bool::new(confirmed),));
     }
 
-    #[cfg(all(test, target_os = "macos"))]
+    #[cfg(test)]
     mod tests {
+        #[cfg(target_os = "macos")]
         use super::parse_titlebar_message;
+        use super::ZoomAction;
+        #[cfg(target_os = "macos")]
         use tao::window::Theme;
 
+        #[test]
+        fn zoom_steps_clamp_and_reset() {
+            assert_eq!(ZoomAction::In.next(100), 110);
+            assert_eq!(ZoomAction::In.next(200), 200);
+            assert_eq!(ZoomAction::Out.next(100), 90);
+            assert_eq!(ZoomAction::Out.next(50), 50);
+            assert_eq!(ZoomAction::Reset.next(50), 100);
+            assert_eq!(ZoomAction::Reset.next(200), 100);
+        }
+
+        #[cfg(target_os = "macos")]
         #[test]
         fn titlebar_messages_carry_a_preference_and_an_opaque_color() {
             assert_eq!(
