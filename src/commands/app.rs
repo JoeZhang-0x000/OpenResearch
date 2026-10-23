@@ -814,7 +814,11 @@ mod imp {
             .with_accept_first_mouse(true)
             // Lets the dashboard tell it is in the app, where pop-ups open in the browser.
             .with_initialization_script("window.__ORX_DESKTOP__ = true;")
-            .with_initialization_script(include_str!("desktop_zoom.js"))
+            .with_initialization_script_for_main_only(
+                include_str!("desktop_zoom.js")
+                    .replace("__ORX_ZOOM_PLATFORM__", std::env::consts::OS),
+                false,
+            )
             // Pop-ups go to the browser, dashboard pages included: a window wry
             // opens itself has none of this window's handlers.
             .with_new_window_req_handler(|url, _features| {
