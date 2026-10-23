@@ -941,7 +941,10 @@ mod imp {
         #[cfg(target_os = "macos")]
         add_confirm_panel(&webview);
 
-        let mut zoom_percent = 100;
+        let mut zoom_percent = crate::config::desktop_zoom_percent();
+        if let Err(error) = sync_page_zoom(&webview, zoom_percent, false) {
+            eprintln!("openresearch app: could not restore page zoom: {error}");
+        }
         let mut quit = Quit::No;
         // What the loaded page was last told; a new page starts unmaximized.
         #[cfg(windows)]
@@ -1001,13 +1004,20 @@ mod imp {
             }
             Event::UserEvent(UserEvent::Zoom(action)) if matches!(quit, Quit::No) => {
                 let next = action.next(zoom_percent);
-                match sync_page_zoom(&webview, next) {
-                    Ok(()) => zoom_percent = next,
+                match sync_page_zoom(&webview, next, true) {
+                    Ok(()) => {
+                        if next != zoom_percent {
+                            zoom_percent = next;
+                            if let Err(error) = crate::config::set_desktop_zoom_percent(next) {
+                                eprintln!("openresearch app: could not save page zoom: {error}");
+                            }
+                        }
+                    }
                     Err(error) => eprintln!("openresearch app: could not apply page zoom: {error}"),
                 }
             }
             Event::UserEvent(UserEvent::SyncZoom) if matches!(quit, Quit::No) => {
-                let _ = sync_page_zoom(&webview, zoom_percent);
+                let _ = sync_page_zoom(&webview, zoom_percent, false);
             }
             // Even before the page loads: a launch that brings nothing up looks
             // like a broken app. While quitting it must stay hidden.
@@ -1126,12 +1136,13 @@ mod imp {
         let _ = webview.evaluate_script(&script);
     }
 
-    fn sync_page_zoom(webview: &WebView, percent: i32) -> wry::Result<()> {
+    fn sync_page_zoom(webview: &WebView, percent: i32, show_controls: bool) -> wry::Result<()> {
         let factor = f64::from(percent) / 100.0;
         webview.zoom(factor)?;
         // The native traffic lights and drag strip keep their unscaled size.
         webview.evaluate_script(&format!(
-            "document.documentElement.style.setProperty('--desktop-page-zoom', '{factor}');"
+            "document.documentElement.style.setProperty('--desktop-page-zoom', '{factor}');
+             if ({show_controls}) window.dispatchEvent(new CustomEvent('orx:page-zoom', {{ detail: {percent} }}));"
         ))
     }
 
