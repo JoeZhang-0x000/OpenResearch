@@ -624,6 +624,8 @@ mod imp {
     enum UserEvent {
         ServerReady,
         LoadTimedOut,
+        SyncZoom,
+        Zoom(ZoomAction),
         #[cfg(target_os = "macos")]
         Menu(MenuId),
         #[cfg(not(target_os = "macos"))]
@@ -632,6 +634,38 @@ mod imp {
         Close,
         #[cfg(windows)]
         SyncMaximized,
+    }
+
+    #[derive(Clone, Copy)]
+    enum ZoomAction {
+        In,
+        Out,
+        Reset,
+    }
+
+    impl ZoomAction {
+        fn next(self, percent: i32) -> i32 {
+            match self {
+                Self::In => (percent + 10).min(200),
+                Self::Out => (percent - 10).max(50),
+                Self::Reset => 100,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod zoom_tests {
+        use super::ZoomAction;
+
+        #[test]
+        fn zoom_steps_clamp_and_reset() {
+            assert_eq!(ZoomAction::In.next(100), 110);
+            assert_eq!(ZoomAction::In.next(200), 200);
+            assert_eq!(ZoomAction::Out.next(100), 90);
+            assert_eq!(ZoomAction::Out.next(50), 50);
+            assert_eq!(ZoomAction::Reset.next(50), 100);
+            assert_eq!(ZoomAction::Reset.next(200), 100);
+        }
     }
 
     enum Quit {
@@ -700,7 +734,17 @@ mod imp {
         let (menu, quit_item, reload_item) = {
             let menu_proxy = event_loop.create_proxy();
             MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
-                let _ = menu_proxy.send_event(UserEvent::Menu(event.id));
+                let action = match event.id.as_ref() {
+                    "zoom-in" => Some(ZoomAction::In),
+                    "zoom-out" => Some(ZoomAction::Out),
+                    "zoom-reset" => Some(ZoomAction::Reset),
+                    _ => None,
+                };
+                let event = match action {
+                    Some(action) => UserEvent::Zoom(action),
+                    None => UserEvent::Menu(event.id),
+                };
+                let _ = menu_proxy.send_event(event);
             }));
             let quit = MenuItem::new(
                 "Quit OpenResearch",
@@ -712,7 +756,20 @@ mod imp {
                 true,
                 Some(Accelerator::new(Modifiers::META, Code::KeyR)),
             );
-            match build_menu(&quit, &reload) {
+            let zoom_items = [
+                ("zoom-in", "Zoom In", Code::Equal),
+                ("zoom-out", "Zoom Out", Code::Minus),
+                ("zoom-reset", "Actual Size", Code::Digit0),
+            ]
+            .map(|(id, title, key)| {
+                MenuItem::with_id(
+                    id,
+                    title,
+                    true,
+                    Some(Accelerator::new(Modifiers::META, key)),
+                )
+            });
+            match build_menu(&quit, &reload, &zoom_items) {
                 Ok(menu) => (menu, quit, reload),
                 Err(err) => {
                     crate::show_error_dialog(&format!("Could not build the menu bar: {err}"));
@@ -772,6 +829,7 @@ mod imp {
             .with_accept_first_mouse(true)
             // Lets the dashboard tell it is in the app, where pop-ups open in the browser.
             .with_initialization_script("window.__ORX_DESKTOP__ = true;")
+            .with_initialization_script(include_str!("desktop_zoom.js"))
             // Pop-ups go to the browser, dashboard pages included: a window wry
             // opens itself has none of this window's handlers.
             .with_new_window_req_handler(|url, _features| {
@@ -796,11 +854,13 @@ mod imp {
                 let window = window.clone();
                 let origin = origin.clone();
                 let shown = shown.clone();
-                #[cfg(windows)]
                 let proxy = event_loop.create_proxy();
                 move |event, url| {
                     if !matches!(event, PageLoadEvent::Finished) {
                         return;
+                    }
+                    if super::is_dashboard_url(&url, &origin) {
+                        let _ = proxy.send_event(UserEvent::SyncZoom);
                     }
                     #[cfg(windows)]
                     let _ = proxy.send_event(UserEvent::SyncMaximized);
@@ -810,17 +870,27 @@ mod imp {
                     }
                 }
             });
-        #[cfg(not(target_os = "linux"))]
         let builder = builder.with_ipc_handler({
+            #[cfg(not(target_os = "linux"))]
             let window = window.clone();
-            #[cfg(windows)]
             let proxy = event_loop.create_proxy();
             move |request| {
                 let message = request.body().as_str();
                 match message {
+                    "page-zoom:in" => {
+                        let _ = proxy.send_event(UserEvent::Zoom(ZoomAction::In));
+                    }
+                    "page-zoom:out" => {
+                        let _ = proxy.send_event(UserEvent::Zoom(ZoomAction::Out));
+                    }
+                    "page-zoom:reset" => {
+                        let _ = proxy.send_event(UserEvent::Zoom(ZoomAction::Reset));
+                    }
+                    #[cfg(not(target_os = "linux"))]
                     "titlebar:drag" => {
                         let _ = window.drag_window();
                     }
+                    #[cfg(not(target_os = "linux"))]
                     "titlebar:zoom" => window.set_maximized(!window.is_maximized()),
                     #[cfg(windows)]
                     "titlebar:minimize" => window.set_minimized(true),
@@ -837,6 +907,8 @@ mod imp {
                             let _ = window.drag_resize_window(direction);
                         }
                     }
+                    #[cfg(target_os = "linux")]
+                    _ => {}
                     #[cfg(target_os = "macos")]
                     _ => {
                         if let Some((appearance, color)) = parse_titlebar_message(message) {
@@ -875,6 +947,7 @@ mod imp {
         #[cfg(target_os = "macos")]
         add_confirm_panel(&webview);
 
+        let mut zoom_percent = 100;
         let mut quit = Quit::No;
         // What the loaded page was last told; a new page starts unmaximized.
         #[cfg(windows)]
@@ -931,6 +1004,16 @@ mod imp {
             #[cfg(target_os = "macos")]
             Event::UserEvent(UserEvent::Menu(id)) if id == reload_item.id() => {
                 let _ = webview.reload();
+            }
+            Event::UserEvent(UserEvent::Zoom(action)) if matches!(quit, Quit::No) => {
+                let next = action.next(zoom_percent);
+                match sync_page_zoom(&webview, next) {
+                    Ok(()) => zoom_percent = next,
+                    Err(error) => eprintln!("openresearch app: could not apply page zoom: {error}"),
+                }
+            }
+            Event::UserEvent(UserEvent::SyncZoom) if matches!(quit, Quit::No) => {
+                let _ = sync_page_zoom(&webview, zoom_percent);
             }
             // Even before the page loads: a launch that brings nothing up looks
             // like a broken app. While quitting it must stay hidden.
@@ -1049,8 +1132,21 @@ mod imp {
         let _ = webview.evaluate_script(&script);
     }
 
+    fn sync_page_zoom(webview: &WebView, percent: i32) -> wry::Result<()> {
+        let factor = f64::from(percent) / 100.0;
+        webview.zoom(factor)?;
+        // The native traffic lights and drag strip keep their unscaled size.
+        webview.evaluate_script(&format!(
+            "document.documentElement.style.setProperty('--desktop-page-zoom', '{factor}');"
+        ))
+    }
+
     #[cfg(target_os = "macos")]
-    fn build_menu(quit: &MenuItem, reload: &MenuItem) -> muda::Result<Menu> {
+    fn build_menu(
+        quit: &MenuItem,
+        reload: &MenuItem,
+        zoom_items: &[MenuItem; 3],
+    ) -> muda::Result<Menu> {
         let about = AboutMetadata {
             name: Some("OpenResearch".into()),
             version: Some(env!("CARGO_PKG_VERSION").into()),
@@ -1090,6 +1186,10 @@ mod imp {
                 true,
                 &[
                     reload,
+                    &PredefinedMenuItem::separator(),
+                    &zoom_items[0],
+                    &zoom_items[1],
+                    &zoom_items[2],
                     &PredefinedMenuItem::separator(),
                     &PredefinedMenuItem::fullscreen(None),
                 ],
